@@ -1,0 +1,4272 @@
+---
+title: "Temporal dynamics of multidimensional traits and growth"
+author:
+  - 杨菁
+date: '`r format(Sys.Date())`'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    number_sections: false
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+editor_options: 
+  chunk_output_type: console
+---
+
+<style type='text/css'>
+
+body{ /* Normal  */
+      font-size: 16px;
+      font-family: 'Times New Roman'
+  }
+td {  /* Table  */
+  font-size: 14px;
+}
+h1.title {
+  font-size: 34px;
+  color: Black;
+  font-family: 'Arial';
+}
+h1 { /* Header 1 */
+  font-size: 26px;
+  color: DarkBlue;
+  font-family: 'Arial';
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+    font-family: 'Arial';
+    color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: 'Arial';
+  color: DarkBlue;
+}
+
+h4 { /* Header 4 */
+  font-size: 16px;
+  font-family: 'Arial';
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 12px;
+}
+</style>
+
+
+```{r Chunk 1, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  tidy = TRUE)
+
+# Load required libraries
+required_libraries <- c(
+  "ggplot2", "patchwork", "knitr", "kableExtra", "hypervolume", "snow",
+  "parallel", "ggsignif", "alphahull", "RColorBrewer", "formatR", "gridExtra",
+  "ggpubr", "fmsb", "tidyr", "ggsci", "TPD", "ggridges", "reshape2", "glmm.hp",
+  "lmerTest", "ape", "nlme", "MuMIn", "performance", "sjPlot", "tibble","ggthemes",
+  "effectsize", "cowplot", "ggcorrplot", "dplyr", "funspace", "purrr", "ggpmisc",
+  "ggExtra", "officer", "eoffice", "broom.mixed", "lme4", "vegan", "ade4", "GGally")
+invisible(suppressPackageStartupMessages(lapply(required_libraries, library, character.only = TRUE)))
+source("visualization_corefun.R")
+# Source custom functions and set font family
+my_family <- "sans"
+
+# Create output directories
+output_dirs <- c("02_output_results_new", "02_output_results_new/analysis_results", "02_output_results_new/figs", "02_output_results_new/tables")
+invisible(sapply(output_dirs, function(dir) dir.create(dir, showWarnings = FALSE)))
+
+# # Set output directory names
+dir_name <- "02_output_results_new/analysis_results"
+f_dir_name <- "02_output_results_new/figs"
+t_dir_name <- "02_output_results_new/tables"
+
+# Traits
+above_traits <- c("LA", "SLA", "LDMC", "LTO", "SSD", "Height")
+fineroot_traits <- c("SRL", "RD", "RTD","SRA")
+trait.names <- c(above_traits, fineroot_traits)
+pca_traits <- c("Above_PC1", "Above_PC2","Above_PC3", "Below_PC1", "Below_PC2")  # PCA components
+
+# Write selected traits to a text file
+writeLines(trait.names, file.path(dir_name, "trait_name.txt"))
+
+species <- c("D. oldhami", "L. glaber", "C. sclerophylla", "C. glauca", "S. superba", "H. acerba", "Q. chenii")
+sp_abbr <- c("DO", "LG", "CS", "CG", "SS", "HA", "QC")
+names(sp_abbr) <- species
+growth_cols <- c(
+  "RGR_H_1yr", "RGR_H_mean", "AGR_H_1yr", "AGR_H_mean",
+  "RGR_BM_mean", "RGR_ABM_mean", "RGR_UBM_mean",
+  "AGR_BM_mean", "AGR_ABM_mean", "AGR_UBM_mean",
+  "RGR_BM_1yr", "RGR_ABM_1yr", "RGR_UBM_1yr",
+  "AGR_BM_1yr", "AGR_ABM_1yr", "AGR_UBM_1yr")
+
+my_colors <- c(
+  "Environment"  = "#7C93C3",
+  "Above-ground" = "#A5B68D",
+  "Below-ground" = "#AB886D",
+  "Trait*Trait"  = "#FFE1AF",
+  "Trait*Env"    = "#C2D9FF")
+```
+
+# data preprocessing 
+```{r Chunk 2,fig.width=8,fig.height=4.5}
+load("01_data/processed_data/trait_growth_data.Rdata")  # object: tda (5818 seedlings)
+table(tda$comp_year)
+tda <- tda %>%
+  mutate(
+    RGR = RGR_H_1yr,
+    RSR = UBM / ABM,
+    # Unit conversion for LTO
+    LTO = LTO * 0.0098 / (pi * 0.001)
+  ) %>%
+  select(
+    sp, sp_abbr, Nenv, Light, Moisture, AP, Compete, growth_time, comp_year, ring.num, memo,
+    RII, final_height, 
+    RGR, RSR, UBM, ABM, BM,
+    all_of(trait.names)
+  )
+table(tda$memo)
+
+library(dplyr)
+
+neg_growth_summary <- tda %>%
+  filter(memo == "alive", BM > 0) %>%        # 只保留存活且有生物量的个体
+  mutate(neg_RGR = RGR < 0) %>% 
+  group_by(comp_year) %>%
+  summarise(
+    n_total = n(),
+    n_RGR_le_0 = sum(neg_RGR, na.rm = TRUE),
+    prop_RGR_le_0 = n_RGR_le_0 / n_total
+  )
+
+neg_growth_summary
+
+```
+
+## clean RGR
+```{r}
+# -----------------------------
+# Diagnostics before cleaning (optional but useful)
+# -----------------------------
+counts_per_year <- tda %>%
+  filter(memo != "S", !is.na(RGR), RGR <= 0) %>%
+  group_by(comp_year) %>%
+  summarise(n_ind = n(), .groups = "drop")
+
+counts_per_year_complete_traits <- tda %>%
+  filter(memo != "S", !is.na(RGR), RGR <= 0) %>%
+  filter(if_all(all_of(trait.names), ~ !is.na(.))) %>%
+  group_by(comp_year) %>%
+  summarise(n_ind = n(), .groups = "drop")
+
+# -----------------------------
+# Clean RGR: set non-positive and outliers to NA
+# -----------------------------
+n_rgr_nonpos <- sum(tda$RGR <= 0, na.rm = TRUE)
+tda <- tda %>%
+  mutate(
+    RGR = if_else(!is.na(RGR) & RGR <= 0, NA_real_, as.numeric(RGR))
+  )
+mean_rgr <- mean(tda$RGR, na.rm = TRUE)
+sd_rgr   <- sd(tda$RGR, na.rm = TRUE)
+upper <- mean_rgr + 4 * sd_rgr
+lower <- mean_rgr - 4 * sd_rgr
+n_rgr_outlier <- sum(tda$RGR > upper | tda$RGR < lower, na.rm = TRUE)
+tda <- tda %>%
+  mutate(
+    RGR = if_else(!is.na(RGR) & (RGR > upper | RGR < lower), NA_real_, RGR)
+  )
+n_dead <- sum(tda$memo == "S", na.rm = TRUE)
+n_rgr_na_not_dead <- sum(is.na(tda$RGR) & tda$memo != "S", na.rm = TRUE)
+
+cat("RGR <= 0 set to NA:", n_rgr_nonpos, "\n")
+cat("RGR outliers (±4 SD) set to NA:", n_rgr_outlier, "\n")
+cat("Dead individuals (memo == 'S'):", n_dead, "\n")
+cat("RGR is NA but memo != 'S':", n_rgr_na_not_dead, "\n")
+
+# Keep only living individuals with valid RGR
+tda <- tda %>%
+  filter(memo != "S", !is.na(RGR), RGR > 0) ## 4171 inds
+```
+
+## prepare trait data
+```{r}
+ordered_cols <- c(
+  "Nenv", "Light", "Moisture", "AP", "Compete", "sp", "sp_abbr", "growth_time", "comp_year", "ring.num",
+  "final_height", "BM", "ABM", "RSR", "UBM", "RGR",trait.names)
+indtraits_tda <- tda %>%
+  select(all_of(ordered_cols)
+  ) %>%
+  mutate(across(all_of(trait.names), as.numeric))
+
+# Traits to log-transform then scale (keep your original exceptions)
+traits_log_scale <- setdiff(trait.names, c("LTO", "LDMC", "RD"))
+traits_scale_only <- c("LTO", "LDMC", "RD")
+
+indtraits_tda <- indtraits_tda %>%
+  mutate(
+    across(all_of(traits_log_scale), ~ as.numeric(scale(log10(.)))),
+    across(all_of(traits_scale_only), ~ as.numeric(scale(.))))
+
+# Standardize growth_time (optional: keep if used later)
+indtraits_tda <- indtraits_tda %>%
+  mutate(growth_time = as.numeric(scale(as.numeric(growth_time))))
+
+# Extract main trait-environment data (first 25 columns)
+pcatraits_tda <- na.omit(indtraits_tda) ## 3670
+pcatraits_tda$sp <- factor(pcatraits_tda$sp, levels = species)
+# Arrange columns in the desired order for analysis and output
+pcatraits_tda <- pcatraits_tda %>% dplyr::select(all_of(ordered_cols))
+table(pcatraits_tda$comp_year)
+
+# Check functional space dimensions for aboveground and fineroot traits
+funspaceDim(na.omit(pcatraits_tda[, above_traits]))
+funspaceDim(na.omit(pcatraits_tda[, fineroot_traits]))
+```
+
+# Results
+## Figure 2 Principal Component Analysis (PCA)
+```{r Chunk 4,fig.height=8,fig.width=8}
+source("visualization_corefun_new.R")
+############################### Principal Component Analysis (PCA) 
+# Perform PCA for aboveground traits
+above_pr <- summary(princomp(pcatraits_tda[, above_traits], cor = TRUE))
+pcatraits_tda[paste0("Above_PC", 1:length(above_traits))] <- above_pr$scores
+pcatraits_tda$Above_PC1 <- 1 * pcatraits_tda$Above_PC1
+pcatraits_tda$Above_PC2 <- 1 * pcatraits_tda$Above_PC2
+# Perform PCA for fineroot traits
+#froot_pr <- summary(princomp(total_scaled_tda[, fineroot_traits], cor = TRUE))
+library(psych)
+froot_pr <- principal(
+  pcatraits_tda[, fineroot_traits],
+  nfactors = length(fineroot_traits),
+  rotate = "varimax",
+  scores = TRUE,
+  covar = TRUE)
+
+pcatraits_tda[paste0("Below_PC", 1:length(fineroot_traits))] <- froot_pr$scores
+pcatraits_tda$Below_PC1 <- -1 * pcatraits_tda$Below_PC1 
+pcatraits_tda$Below_PC2 <- 1 * pcatraits_tda$Below_PC2 
+
+above_loadings_matrix <- as.matrix(above_pr$loadings)
+above_loadings_df <- data.frame(Variable = rownames(above_loadings_matrix), above_loadings_matrix)
+above_loadings_df <- above_loadings_df[1:6, ]
+above_loadings_df[, -1] <- round(above_loadings_df[, -1], 2)
+rownames(above_loadings_df) <- paste0("PC", 1:6)
+write.csv(above_loadings_df, file = "02_output_results_new/tables/above_loadings_export.csv", row.names = FALSE)
+
+froot_loadings_matrix <- as.matrix(froot_pr$loadings)
+froot_loadings_df <- data.frame(Variable = rownames(froot_loadings_matrix), froot_loadings_matrix)
+froot_loadings_df <- froot_loadings_df[1:4, ]
+froot_loadings_df[, -1] <- round(froot_loadings_df[, -1], 2)
+rownames(froot_loadings_df) <- paste0("PC", 1:4)
+write.csv(froot_loadings_df, file = "02_output_results_new/tables/froot_loadings_export.csv", row.names = FALSE)
+
+cp_shape <- c(21,21,21)
+
+above_pca <- Above_Comp_PCA(pcatraits_tda, above_pr, above_traits, 
+                            "(a) Aboveground", c(-5.2, 5), c(-5,4.6), cp_shape) +
+  theme(legend.position = "none")
+
+above_pca2 <- Above_Comp_PCA2(pcatraits_tda, above_pr, above_traits, 
+                              "(b) Aboveground", c(-5.2, 5), c(-4, 4.6), cp_shape) + 
+  theme(legend.position = "none")
+
+froot_pca <- Below_Comp_PCA(pcatraits_tda, froot_pr, fineroot_traits, 
+                            "(c) Fine roots", c(-4,4.3), c(-5,5), cp_shape) + 
+  theme(legend.position = "none")
+
+above_pca_plot  <- ggMarginal(above_pca,  type = "boxplot",
+                              groupColour = TRUE, groupFill = FALSE,
+                              fill = "white")
+
+above_pca_plot2 <- ggMarginal(above_pca2, type = "boxplot",
+                              groupColour = TRUE, groupFill = FALSE,
+                              fill = "white")
+
+froot_pca_plot  <- ggMarginal(froot_pca,  type = "boxplot",
+                              groupColour = TRUE, groupFill = FALSE,
+                              fill = "white")
+
+fig3_combined_pca_plot2 <- plot_grid(above_pca_plot, above_pca_plot2, froot_pca_plot,
+                                     labels = NULL, ncol = 2)
+fig3_combined_pca_plot2
+
+ggsave(fig3_combined_pca_plot2,file="02_output_results_new/figs/fig2_pca_year.pdf",height = 7.5,width = 7.5)
+```
+
+# Trait-Growth model R2 changes over years
+```{r}
+pcatraits_tda1 <- pcatraits_tda
+pcatraits_tda1$Above_PC1 <- scale(pcatraits_tda1$Above_PC1)
+pcatraits_tda1$Above_PC2 <- scale(pcatraits_tda1$Above_PC2)
+pcatraits_tda1$Above_PC3 <- scale(pcatraits_tda1$Above_PC3)
+pcatraits_tda1$Below_PC1 <- scale(pcatraits_tda1$Below_PC1)
+pcatraits_tda1$Below_PC2 <- scale(pcatraits_tda1$Below_PC2)
+pcatraits_tda1$Light <- scale(pcatraits_tda1$Light)
+pcatraits_tda1$Moisture <- scale(pcatraits_tda1$Moisture)
+pcatraits_tda1$AP <- scale(pcatraits_tda1$AP)
+pcatraits_tda1$growth_time <- scale(as.numeric(pcatraits_tda1$growth_time))
+pcatraits_tda1$RGR_scale <- scale(pcatraits_tda1$RGR)
+
+tda_1st <- pcatraits_tda1[pcatraits_tda1$comp_year == "1st", ]
+tda_2nd <- pcatraits_tda1[pcatraits_tda1$comp_year == "2nd", ]
+tda_3rd <- pcatraits_tda1[pcatraits_tda1$comp_year == "3rd", ]
+```
+
+## Part models
+### Part models----Community-level
+```{r}
+library(lmerTest)
+library(MuMIn)
+library(dplyr)
+library(broom.mixed) 
+library(ggplot2)
+library(ggpmisc)
+
+extract_model_stats <- function(dat, t_a, t_b, e_v) {
+  
+  # Define full model formula (M5) including all interaction terms
+  f5 <- paste("RGR ~", e_v, "+", t_a, "+", t_b, "+", 
+              t_a,":",t_b, "+", 
+              t_a,":",e_v, "+", 
+              t_b,":",e_v, "+ (1|sp) + (1|Nenv)")
+  
+  # Fit the model (Removed tryCatch: Errors will stop execution for debugging)
+  mod <- lmer(as.formula(f5), data = dat, REML = FALSE, 
+              control = lmerControl(optimizer = "bobyqa"))
+  
+  # --- A. Extract Marginal R2 ---
+  r2_out <- MuMIn::r.squaredGLMM(mod)
+  
+  if (is.matrix(r2_out)) {
+    r2_val <- r2_out[1, "R2m"] 
+  } else {
+    r2_val <- r2_out["R2m"]
+  }
+  
+  if (is.na(r2_val) || is.nan(r2_val)) r2_val <- NA_real_
+  
+  # --- B. Calculate RGR statistics for the data used in model ---
+  model_frame <- model.frame(mod)
+  mean_rgr <- mean(model_frame[, "RGR"], na.rm = TRUE)
+  var_rgr  <- var(model_frame[, "RGR"], na.rm = TRUE)
+  
+  # --- C. Extract fixed effects coefficients ---
+  coefs <- broom.mixed::tidy(mod, effects = "fixed") %>%
+    select(term, estimate, std.error, statistic, p.value)
+  
+  # Map terms to logical groups
+  coefs <- coefs %>%
+    mutate(
+      Effect_Type = case_when(
+        term == "(Intercept)" ~ "Intercept",
+        term == e_v ~ "Env",
+        term == t_a ~ "Above",
+        term == t_b ~ "Below",
+        grepl(":", term) & grepl(t_a, term) & grepl(t_b, term) ~ "TT",
+        grepl(":", term) & grepl(e_v, term) ~ "TE", 
+        TRUE ~ "Other"
+      )
+    )
+  
+  # Append model-level statistics
+  coefs$Marginal_R2 <- as.numeric(r2_val)
+  coefs$Mean_RGR <- mean_rgr
+  coefs$Var_RGR <- var_rgr
+  
+  return(coefs)
+}
+
+above_traits <- c("Above_PC1", "Above_PC2", "Above_PC3")
+below_traits <- c("Below_PC1", "Below_PC2")
+env_vars     <- c("Light", "Moisture", "AP", "Compete")
+combinations <- expand.grid(Above = above_traits, Below = below_traits, Env = env_vars, stringsAsFactors = FALSE)
+year_datasets <- list("1st" = tda_1st, "2nd" = tda_2nd, "3rd" = tda_3rd)
+model_coefficients_results <- data.frame()
+
+for (year_name in names(year_datasets)) {
+  current_dat <- year_datasets[[year_name]]
+  
+  for (i in 1:nrow(combinations)) {
+    
+    curr_above <- combinations$Above[i]
+    curr_below <- combinations$Below[i]
+    curr_env   <- combinations$Env[i]
+    
+    res_df <- extract_model_stats(current_dat, curr_above, curr_below, curr_env)
+    
+    if (is.null(res_df)) next
+    
+    # Add metadata
+    res_df$Year <- year_name
+    res_df$Combination_ID <- i
+    res_df$Trait_Above_Name <- curr_above
+    res_df$Trait_Below_Name <- curr_below
+    res_df$Env_Var_Name <- curr_env
+    
+    model_coefficients_results <- rbind(model_coefficients_results, res_df)
+  }
+}
+
+
+```
+
+### Part models----Species-level
+```{r}
+library(lmerTest)
+library(MuMIn)
+library(dplyr)
+library(broom.mixed) 
+
+# ==============================================================================
+# 1. Function to extract stats (Species-Specific Model)
+# ==============================================================================
+extract_species_stats <- function(dat, t_a, t_b, e_v) {
+  
+  # --- Sample Size Check ---
+  # Remove NAs first to check effective sample size for modeling
+  # (Note: lmer will drop NAs automatically, but we check beforehand)
+  valid_rows <- sum(!is.na(dat$RGR) & !is.na(dat[[t_a]]) & 
+                    !is.na(dat[[t_b]]) & !is.na(dat[[e_v]]))
+  
+  if (valid_rows < 10) return(NULL) # Return NULL to signal skipping
+  
+  # Define model formula (Removed (1|sp) as we are within a single species)
+  f5 <- paste("RGR ~", e_v, "+", t_a, "+", t_b, "+", 
+              t_a,":",t_b, "+", 
+              t_a,":",e_v, "+", 
+              t_b,":",e_v, "+ (1|Nenv)")
+  
+  # Fit the model
+  mod <- tryCatch({
+    lmer(as.formula(f5), data = dat, REML = FALSE, 
+         control = lmerControl(optimizer = "bobyqa"))
+  }, error = function(e) NULL)
+  
+  if (is.null(mod)) return(NULL)
+  
+  # --- A. Extract Marginal R2 ---
+  r2_out <- tryCatch(MuMIn::r.squaredGLMM(mod), error = function(e) NA)
+  
+  if (is.matrix(r2_out)) {
+    r2_val <- r2_out[1, "R2m"] 
+  } else if (!is.na(r2_out)) {
+    r2_val <- r2_out["R2m"]
+  } else {
+    r2_val <- NA_real_
+  }
+  
+  if (is.na(r2_val) || is.nan(r2_val)) r2_val <- NA_real_
+  
+  # --- B. Calculate RGR statistics ---
+  model_frame <- model.frame(mod)
+  mean_rgr <- mean(model_frame[, "RGR"], na.rm = TRUE)
+  var_rgr  <- var(model_frame[, "RGR"], na.rm = TRUE)
+  
+  # --- C. Extract fixed effects coefficients ---
+  coefs <- broom.mixed::tidy(mod, effects = "fixed") %>%
+    select(term, estimate, std.error, statistic, p.value)
+  
+  # Map terms
+  coefs <- coefs %>%
+    mutate(
+      Effect_Type = case_when(
+        term == "(Intercept)" ~ "Intercept",
+        term == e_v ~ "Env",
+        term == t_a ~ "Above",
+        term == t_b ~ "Below",
+        grepl(":", term) & grepl(t_a, term) & grepl(t_b, term) ~ "TT",
+        grepl(":", term) & grepl(e_v, term) ~ "TE", 
+        TRUE ~ "Other"
+      )
+    )
+  
+  # Append stats
+  coefs$Marginal_R2 <- as.numeric(r2_val)
+  coefs$Mean_RGR <- mean_rgr
+  coefs$Var_RGR <- var_rgr
+  
+  return(coefs)
+}
+
+# ==============================================================================
+# 2. Prepare Loop Variables
+# ==============================================================================
+above_traits <- c("Above_PC1", "Above_PC2", "Above_PC3")
+below_traits <- c("Below_PC1", "Below_PC2")
+env_vars     <- c("Light", "Moisture", "AP", "Compete")
+combinations <- expand.grid(Above = above_traits, Below = below_traits, Env = env_vars, stringsAsFactors = FALSE)
+
+year_datasets <- list("1st" = tda_1st, "2nd" = tda_2nd, "3rd" = tda_3rd)
+species_list  <- unique(tda_1st$sp) # Ensure 'sp' column exists
+
+species_results <- data.frame()
+
+# ==============================================================================
+# 3. Main Nested Loop: Year -> Species -> Combination
+# ==============================================================================
+for (year_name in names(year_datasets)) {
+  current_dat <- year_datasets[[year_name]]
+  
+  for (sp_name in species_list) {
+    
+    # Subset data for current species
+    sp_dat <- current_dat[current_dat$sp == sp_name, ]
+    
+    # Check total rows before entering combination loop (Optimization)
+    if (nrow(sp_dat) < 10) next 
+    
+    for (i in 1:nrow(combinations)) {
+      
+      curr_above <- combinations$Above[i]
+      curr_below <- combinations$Below[i]
+      curr_env   <- combinations$Env[i]
+      
+      # Extract stats
+      res_df <- extract_species_stats(sp_dat, curr_above, curr_below, curr_env)
+      
+      # Handling insufficient data or model failure
+      if (is.null(res_df)) {
+        # Optional: create a row with NAs if you want to track failures explicitly
+        # For now, we just skip
+        next 
+      }
+      
+      # Add metadata
+      res_df$Year <- year_name
+      res_df$Species <- sp_name  # <--- New Metadata
+      res_df$Combination_ID <- i
+      res_df$Trait_Above_Name <- curr_above
+      res_df$Trait_Below_Name <- curr_below
+      res_df$Env_Var_Name <- curr_env
+      
+      species_results <- rbind(species_results, res_df)
+    }
+  }
+}
+
+# ==============================================================================
+# 4. Post-processing
+# ==============================================================================
+head(species_results)
+
+final_species_coefs <- species_results
+```
+
+## Figure 3
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggpmisc)
+library(patchwork)
+
+df_community_raw <- model_coefficients_results %>%
+  select(Year, Combination_ID, Marginal_R2, Mean_RGR) %>%
+  distinct()
+
+library(dplyr)
+
+df_community_raw1 <- df_community_raw %>%
+  mutate(
+    Year_num = case_when(
+      Year == "1st" ~ 1,
+      Year == "2nd" ~ 2,
+      Year == "3rd" ~ 3
+    )
+  )
+
+library(lme4)
+library(lmerTest)
+
+m_year <- lmer(
+  Marginal_R2 ~ Year_num + (1 | Combination_ID),
+  data = df_community_raw1
+)
+
+summary(m_year)
+tab_model(m_year)
+
+df_community_summary <- df_community_raw %>%
+  group_by(Year) %>%
+  summarise(
+    R2  = mean(Marginal_R2, na.rm = TRUE),
+    SE  = sd(Marginal_R2, na.rm = TRUE) / sqrt(n()),
+    RGR = mean(Mean_RGR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Year = factor(Year, levels = c("1st", "2nd", "3rd")),
+    Level = "Community"
+  )
+
+df_species_raw <- final_species_coefs %>%
+  select(Year, Species, Combination_ID, Marginal_R2, Mean_RGR) %>%
+  distinct() 
+
+library(dplyr)
+
+df_species_raw1 <- df_species_raw %>%
+  mutate(
+    Year_num = case_when(
+      Year == "1st" ~ 1,
+      Year == "2nd" ~ 2,
+      Year == "3rd" ~ 3,
+      TRUE ~ NA_real_
+    ),
+    Species = factor(Species),
+    Combination_ID = factor(Combination_ID)
+  )
+library(lme4)
+library(lmerTest)
+
+m_sp2 <- lmer(
+  Marginal_R2 ~ Year_num + (1 | Species) + (1 | Combination_ID),
+  data = df_species_raw1,
+  REML = TRUE
+)
+
+summary(m_sp2)
+
+
+df_species_summary <- df_species_raw %>%
+  group_by(Year, Species) %>%
+  summarise(
+    R2  = mean(Marginal_R2, na.rm = TRUE),
+    # 修正关键点：这里明确计算 24 个组合的 SE
+    # SE = SD(24个R2) / sqrt(24)
+    SE  = sd(Marginal_R2, na.rm = TRUE) / sqrt(n_distinct(Combination_ID)), 
+    RGR = mean(Mean_RGR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Year = factor(Year, levels = c("1st", "2nd", "3rd")),
+    Level = "Species" 
+  )
+
+pcatraits_tda$RGR
+
+df_combined <- bind_rows(
+  df_community_summary %>% select(Year, R2, SE, RGR, Level),
+  df_species_summary %>% select(Year, R2, SE, RGR, Level)
+) %>%
+  mutate(Level = factor(Level, levels = c("Community", "Species")))
+
+p_a <- ggplot(df_community_summary, aes(x = Year, y = R2)) +
+  geom_errorbar(aes(ymin = R2 - SE, ymax = R2 + SE, color = Year),
+                width = 0.15, size = 1) +
+  geom_point(aes(color = Year), size = 3) +
+  geom_text(aes(label = paste0("Mean RGR: ", sprintf("%.2f", RGR))),
+            color = "black",
+            vjust = -2.0,
+            hjust = 0.5,
+            size = 3.5, fontface = "plain") +
+  scale_color_manual(values = c("1st"="#FFE7CC", "2nd"="#F8CBA6", "3rd"="#E08E6D")) +
+  labs(
+    title = "(a) Community-level predictive power",
+    y = expression("Marginal " * italic(R)^2 * "of growth models"),
+    x = "Harvest year"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+  theme_Publication(base_size = 11) +
+  theme(legend.position = "none")
+
+p_b <- ggplot(df_species_summary, aes(x = Year, y = R2)) +
+  geom_violin(aes(color = Year), fill = NA, trim = FALSE, size = 0.8) +
+  geom_jitter(aes(color = Year), shape = 17, size = 2.5, alpha = 0.8, width = 0.1) +
+  scale_color_manual(values = c("1st"="#FFE7CC", "2nd"="#F8CBA6", "3rd"="#E08E6D")) +
+  labs(
+    title = "(b) Species-level predictive power",
+    y = NULL,
+    x = "Harvest year"
+  ) +
+  theme_Publication(base_size = 11) +
+  theme(legend.position = "none")
+
+p_c <- ggplot(df_combined, aes(x = RGR, y = R2)) +
+  geom_errorbar(aes(ymin = R2 - SE, ymax = R2 + SE, color = Year),
+                width = 0, size = 0.8, alpha = 1) +
+  geom_point(aes(color = Year, shape = Level, size = Level), alpha = 95) +
+  geom_smooth(method = "lm", color = "black", se = TRUE, size = 0.8, fill = "grey80",alpha=0.6) +
+  stat_poly_eq(
+    aes(label = paste(after_stat(rr.label), after_stat(p.value.label), sep = "*\", \"*")),
+    formula = y ~ x, parse = TRUE,
+    label.x = "right", label.y = "bottom", size = 4
+  ) +
+  scale_color_manual(values = c("1st"="#FFE7CC", "2nd"="#F8CBA6", "3rd"="#E08E6D")) +
+  scale_shape_manual(values = c("Community" = 19, "Species" = 17)) +
+  scale_size_manual(values = c("Community" = 3.5, "Species" = 3)) +
+  scale_x_log10(
+    breaks = c(0.1, 0.15, 0.2, 0.3, 0.4, 0.5),
+    labels = scales::label_number(drop0trailing = TRUE)
+  ) +
+  labs(
+    title = "(c) Effect of growth rate (Combined levels)",
+    y = expression("Marginal " * italic(R)^2 %+-% "SE"),
+    x = "Mean relative growth rate (log scale)"
+  ) +
+  theme_Publication(base_size = 11)
+
+final_plot <- (p_a + p_b) / p_c + plot_layout(heights = c(1, 0.9))
+
+print(final_plot)
+
+ggsave(
+  final_plot <- (p_a + p_b) / p_c + plot_layout(heights = c(1, 0.9)),
+  file = "02_output_results_new/figs/fig3_part_growth_r2.pdf",
+  height = 7.5, width = 7
+)
+library(eoffice)
+topptx(final_plot,filename = "02_output_results_new/figs/fig3_part_growth_r2.pptx",
+  height = 6.8, width = 6.5
+)
+
+
+```
+
+## Full model---community-level
+```{r}
+library(lme4)
+library(lmerTest)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+library(MuMIn) # 必须加载 MuMIn 包来计算 R2
+
+# ==============================================================================
+# 1. 运行模型 (保持不变)
+# ==============================================================================
+formula_full <- RGR_scale ~ Light + Moisture + AP + Compete + growth_time +
+  Above_PC1 + Above_PC2 + Above_PC3 + Below_PC1 + Below_PC2 +
+  Above_PC1:Below_PC1 + Above_PC2:Below_PC1 + Above_PC3:Below_PC1 +
+  Above_PC1:Below_PC2 + Above_PC2:Below_PC2 + Above_PC3:Below_PC2 +
+  Below_PC1:Below_PC2 + Above_PC1:Above_PC2 + Above_PC1:Above_PC3 +
+  Above_PC2:Above_PC3 + Above_PC1:Light + Above_PC1:Moisture + Above_PC1:AP + Above_PC1:Compete +
+  Above_PC2:Light + Above_PC2:Moisture + Above_PC2:AP + Above_PC2:Compete +
+  Above_PC3:Light + Above_PC3:Moisture + Above_PC3:AP + Above_PC3:Compete +
+  Below_PC1:Light + Below_PC1:Moisture + Below_PC1:AP + Below_PC1:Compete +
+  Below_PC2:Light + Below_PC2:Moisture + Below_PC2:AP + Below_PC2:Compete +
+  (1 | sp) + (1 | Nenv)
+
+# 确保数据已加载
+lm1 <- lmer(formula_full, data = tda_1st, REML = FALSE)
+lm2 <- lmer(formula_full, data = tda_2nd, REML = FALSE)
+lm3 <- lmer(formula_full, data = tda_3rd, REML = FALSE)
+
+# ==============================================================================
+# 2. 目标变量顺序 (Target Order - 包含 Compete)
+# ==============================================================================
+target_order <- c(
+  # --- Single Predictors ---
+  "Above_PC1", "Above_PC2", "Above_PC3",
+  "Below_PC1", "Below_PC2",
+  "Light", "Moisture", "AP", "Compete", 
+  
+  # --- Trait x Trait ---
+  "Above_PC1:Below_PC1", "Above_PC1:Below_PC2",
+  "Above_PC2:Below_PC1", "Above_PC2:Below_PC2",
+  "Above_PC3:Below_PC1", "Above_PC3:Below_PC2",
+  "Below_PC1:Below_PC2",
+  "Above_PC1:Above_PC2", "Above_PC1:Above_PC3", "Above_PC2:Above_PC3",
+  
+  # --- Trait x Env ---
+  "Above_PC1:Light", "Above_PC1:Moisture", "Above_PC1:AP", "Above_PC1:Compete",
+  "Above_PC2:Light", "Above_PC2:Moisture", "Above_PC2:AP", "Above_PC2:Compete",
+  "Above_PC3:Light", "Above_PC3:Moisture", "Above_PC3:AP", "Above_PC3:Compete",
+  "Below_PC1:Light", "Below_PC1:Moisture", "Below_PC1:AP", "Below_PC1:Compete",
+  "Below_PC2:Light", "Below_PC2:Moisture", "Below_PC2:AP", "Below_PC2:Compete"
+)
+
+# ==============================================================================
+# 3. 智能匹配函数 (get_model_data_v3 - 保持不变)
+# ==============================================================================
+get_model_data <- function(model, target_vars) {
+  summ <- summary(model)
+  coefs <- as.data.frame(summ$coefficients)
+  coefs$RawName <- rownames(coefs)
+  matched_data <- list()
+  
+  for (target in target_vars) {
+    found <- FALSE
+    # 策略 1: 精确匹配
+    if (target %in% coefs$RawName) {
+      row <- coefs[coefs$RawName == target, ]
+      row$DisplayName <- target
+      matched_data[[target]] <- row
+      found <- TRUE
+    } 
+    # 策略 2: 反转匹配
+    if (!found && grepl(":", target)) {
+      parts <- str_split(target, ":")[[1]]
+      reversed <- paste(parts[2], parts[1], sep = ":")
+      if (reversed %in% coefs$RawName) {
+        row <- coefs[coefs$RawName == reversed, ]
+        row$DisplayName <- target
+        matched_data[[target]] <- row
+        found <- TRUE
+      }
+    }
+    # 策略 3: Compete 模糊匹配
+    if (!found && grepl("Compete", target)) {
+      target_pattern <- gsub("Compete", "Compete.*", target)
+      match_idx <- grep(paste0("^", target_pattern, "$"), coefs$RawName)
+      if (length(match_idx) == 0 && grepl(":", target)) {
+        parts <- str_split(target, ":")[[1]]
+        rev_pattern <- paste0(gsub("Compete", "Compete.*", parts[2]), ":", gsub("Compete", "Compete.*", parts[1]))
+        match_idx <- grep(paste0("^", rev_pattern, "$"), coefs$RawName)
+      }
+      if (length(match_idx) > 0) {
+        actual_name <- coefs$RawName[match_idx[1]]
+        row <- coefs[coefs$RawName == actual_name, ]
+        row$DisplayName <- target
+        matched_data[[target]] <- row
+        found <- TRUE
+      }
+    }
+  }
+  final_df <- do.call(rbind, matched_data)
+  if (is.null(final_df)) return(data.frame())
+  
+  final_df <- final_df %>%
+    mutate(
+      Variable = factor(DisplayName, levels = rev(target_vars)),
+      Estimate = Estimate,
+      Lower = Estimate - 1.96 * `Std. Error`,
+      Upper = Estimate + 1.96 * `Std. Error`,
+      P_val = `Pr(>|t|)`
+    )
+  return(final_df)
+}
+
+# ==============================================================================
+# 4. 绘图函数 (新增 R2 计算与展示)
+# ==============================================================================
+create_forest_plot <- function(model, title_text, target_vars) {
+  
+  # 1. 计算 R2
+  r2_vals <- MuMIn::r.squaredGLMM(model)
+  # 提取 Marginal R2 (固定效应解释的部分)
+  # r.squaredGLMM 返回一个矩阵: [R2m, R2c]
+  r2_m <- round(r2_vals[1, "R2m"], 3)
+  r2_c <- round(r2_vals[1, "R2c"], 3) # 如果需要Conditional R2也可以加上
+  
+  # 构建 subtitle 文本
+  subtitle_text <- bquote(italic(R)[m]^2 == .(r2_m))
+  
+  # 2. 获取数据
+  plot_data <- get_model_data(model, target_vars)
+  
+  if (nrow(plot_data) == 0) return(ggplot() + labs(title = "No Data"))
+  
+  plot_data$col <- case_when(
+    plot_data$P_val < 0.05 ~ "black",
+    plot_data$P_val < 0.10 ~ "grey70",
+    TRUE                   ~ "white"
+  )
+
+  p <- ggplot(plot_data, aes(x = Estimate, y = Variable)) +
+    scale_fill_identity() +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+    geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.2, color = "black") +
+    geom_point(size = 2.5, shape = 21, aes(fill = col), color = "black") +
+    scale_fill_identity() +
+    scale_y_discrete(position = "left") +
+    
+    # 修改 labs 添加 subtitle
+    labs(x = "Standardized Estimate", y = NULL, 
+         title = title_text,
+         subtitle = subtitle_text) + # 这里添加 subtitle
+    
+    theme_classic() +
+    theme(
+      axis.text.y = element_text(size = 10.5, color = "black"),
+      plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 9, color = "grey30"), # subtitle 样式
+      plot.margin = margin(5, 5, 5, 5)
+    )
+  
+  return(p)
+}
+
+p1 <- create_forest_plot(lm1, "(a) 1st Year", target_order) + labs(x=NULL)
+p2 <- create_forest_plot(lm2, "(b) 2nd Year", target_order)
+p3 <- create_forest_plot(lm3, "(c) 3rd Year", target_order) + labs(x=NULL)
+
+p2 <- p2 + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+p3 <- p3 + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+final_forest <- p1 + p2 + p3 + plot_layout(ncol = 3, widths = c(1, 1, 1))
+print(final_forest)
+
+ggsave("02_output_results_new/figs/figSX_robustness_forest_plot_fixed_compete.pdf", 
+       plot = final_forest, width = 8, height = 8)
+
+```
+
+# Relative importance to R2
+### Part models----Community-level
+```{r}
+library(lmerTest)
+library(MuMIn)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+
+decompose_triplet_community <- function(dat, t_a, t_b, e_v) {
+  default_res <- c(Env=0, Above=0, Below=0, TT=0, TE=0)
+  
+  f1 <- paste("RGR ~", e_v, "+ (1|sp) + (1|Nenv)")
+  f2 <- paste("RGR ~", e_v, "+", t_a, "+ (1|sp) + (1|Nenv)")
+  f3 <- paste("RGR ~", e_v, "+", t_a, "+", t_b, "+ (1|sp) + (1|Nenv)")
+  f4 <- paste("RGR ~", e_v, "+", t_a, "+", t_b, "+", t_a,":",t_b, "+ (1|sp) + (1|Nenv)")
+  f5 <- paste("RGR ~", e_v, "+", t_a, "+", t_b, "+", t_a,":",t_b, "+", t_a,":",e_v, "+", t_b,":",e_v, "+ (1|sp) + (1|Nenv)")
+  
+  get_r2 <- function(f) {
+    mod <- tryCatch({
+      lmer(as.formula(f), data = dat, REML = FALSE, control = lmerControl(optimizer = "bobyqa"))
+    }, error = function(e) NULL, warning = function(w) NULL)
+    
+    if (is.null(mod)) return(0)
+    
+    val <- tryCatch({
+      r2_out <- MuMIn::r.squaredGLMM(mod)
+      v <- if (is.matrix(r2_out)) r2_out[1, "R2m"] else r2_out["R2m"]
+      if (is.na(v) || is.nan(v)) 0 else as.numeric(v)
+    }, error = function(e) 0)
+    return(val)
+  }
+  
+  r2_vec <- tryCatch({
+    c(M1=get_r2(f1), M2=get_r2(f2), M3=get_r2(f3), M4=get_r2(f4), M5=get_r2(f5))
+  }, error = function(e) NULL)
+  
+  if (is.null(r2_vec) || length(r2_vec) != 5 || any(is.na(r2_vec))) return(default_res)
+  
+  r2_vec <- cummax(r2_vec)
+  total_r2 <- r2_vec["M5"]
+  
+  if (total_r2 < 0.0001) return(default_res)
+  
+  incr <- c(
+    Env   = r2_vec["M1"],
+    Above = r2_vec["M2"] - r2_vec["M1"],
+    Below = r2_vec["M3"] - r2_vec["M2"],
+    TT    = r2_vec["M4"] - r2_vec["M3"],
+    TE    = r2_vec["M5"] - r2_vec["M4"]
+  )
+  return(pmax(0, incr) / total_r2)
+}
+
+above_traits <- c("Above_PC1", "Above_PC2", "Above_PC3")
+below_traits <- c("Below_PC1", "Below_PC2")
+env_vars     <- c("Light", "Moisture", "AP", "Compete")
+combinations <- expand.grid(Above = above_traits, Below = below_traits, Env = env_vars, stringsAsFactors = FALSE)
+
+year_datasets <- list("1st" = tda_1st, "2nd" = tda_2nd, "3rd" = tda_3rd)
+
+comm_raw_results <- data.frame()
+
+for (year_name in names(year_datasets)) {
+  current_dat <- year_datasets[[year_name]]
+  
+  for (i in 1:nrow(combinations)) {
+    curr_above <- combinations$Above[i]
+    curr_below <- combinations$Below[i]
+    curr_env   <- combinations$Env[i]
+    
+    contribs <- decompose_triplet_community(current_dat, curr_above, curr_below, curr_env)
+    
+    if (is.null(contribs) || length(contribs) != 5 || any(is.na(contribs))) {
+      contribs <- c(0, 0, 0, 0, 0)
+    }
+    
+    tmp_raw <- data.frame(
+      Year = rep(year_name, 5),
+      Combination_ID = rep(i, 5),
+      Trait_Above = rep(curr_above, 5),
+      Trait_Below = rep(curr_below, 5),
+      Env_Var     = rep(curr_env, 5),
+      Component = c("Env", "Above", "Below", "TT", "TE"), 
+      Value = as.numeric(contribs),
+      stringsAsFactors = FALSE
+    )
+    comm_raw_results <- rbind(comm_raw_results, tmp_raw)
+  }
+}
+
+library(dplyr)
+
+df_comm <- comm_raw_results %>%
+  mutate(
+    Level = "Community",
+    Component = factor(Component, levels = c("Env","Above","Below","TT","TE")),
+    Component_Label = case_when(
+      Component == "Env"   ~ "Environment",
+      Component == "Above" ~ "Above-ground",
+      Component == "Below" ~ "Below-ground",
+      Component == "TT"    ~ "Trait*Trait",
+      Component == "TE"    ~ "Trait*Env",
+      TRUE                 ~ as.character(Component)
+    ),
+    Component_Label = factor(
+      Component_Label,
+      levels = c("Environment","Above-ground","Below-ground","Trait*Trait","Trait*Env")
+    ),
+    Year_Num = case_when(
+      Year == "1st" ~ 1,
+      Year == "2nd" ~ 2,
+      Year == "3rd" ~ 3
+    ),
+    Combination_ID = factor(Combination_ID)
+  ) %>%
+  select(Year, Year_Num, Level, Combination_ID, Component, Component_Label, Value)
+
+str(df_comm)
+head(df_comm)
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+
+df_comm <- comm_raw_results %>%
+  mutate(
+    Combination_ID = factor(Combination_ID),
+    Component = factor(Component, levels = c("Env","Above","Below","TT","TE")),
+    Component_Label = case_when(
+      Component == "Env"   ~ "Environment",
+      Component == "Above" ~ "Above-ground",
+      Component == "Below" ~ "Below-ground",
+      Component == "TT"    ~ "Trait*Trait",
+      Component == "TE"    ~ "Trait*Env",
+      TRUE ~ as.character(Component)
+    ),
+    Component_Label = factor(Component_Label,
+      levels = c("Environment","Above-ground","Below-ground","Trait*Trait","Trait*Env")
+    ),
+    Year_Num = case_when(
+      Year == "1st" ~ 1,
+      Year == "2nd" ~ 2,
+      Year == "3rd" ~ 3
+    )
+  ) %>%
+  select(Year, Year_Num, Combination_ID, Component, Component_Label, Value)
+
+fit_comm_component <- function(dat) {
+  m <- lmer(Value ~ Year_Num + (1 | Combination_ID), data = dat, REML = TRUE)
+  co <- summary(m)$coefficients["Year_Num", ]
+  r2 <- r.squaredGLMM(m)[1]  # marginal R2
+
+  p <- unname(co["Pr(>|t|)"])
+
+  tibble(
+    slope = unname(co["Estimate"]),
+    se    = unname(co["Std. Error"]),
+    p     = p,
+    star  = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      p < 0.1   ~ ".",
+      TRUE      ~ ""
+    ),
+    R2 = r2
+  )
+}
+
+res_comm_component <- df_comm %>%
+  group_by(Component, Component_Label) %>%
+  group_modify(~ fit_comm_component(.x)) %>%
+  ungroup()
+
+res_comm_component
+
+
+library(ggplot2)
+library(dplyr)
+
+library(dplyr)
+
+# 如果你表里已经有 star，就直接用；否则按 p 生成
+slopes_comm <- res_comm_component %>%
+  mutate(
+    star = ifelse(!is.na(star), star,
+                  case_when(
+                    p < 0.001 ~ "***",
+                    p < 0.01  ~ "**",
+                    p < 0.05  ~ "*",
+                    p < 0.1   ~ ".",
+                    TRUE      ~ ""
+                  )),
+    lab = paste0("b=", formatC(slope, format = "f", digits = 3), star),
+    x_pos = 3.15
+  )
+
+
+ggplot(df_comm, aes(x = Year_Num, y = Value, color = Component_Label, fill = Component_Label)) +
+  geom_smooth(aes(group = Component_Label), method = "lm", se = TRUE, linewidth = 1, alpha = 0.3) +
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = my_colors) +
+  scale_x_continuous(breaks = 1:3, labels = c("1st", "2nd", "3rd")) +
+  labs(title = "(c) Community-level", y = NULL, x = "Year") +
+  theme_Publication() 
+
+
+
+
+
+
+
+
+
+
+
+
+library(lme4)
+library(lmerTest)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom.mixed)
+library(patchwork)
+
+
+
+
+# 1.1 Main Effect (Env)
+df_env <- comm_raw_results %>% 
+  filter(Component == "Env") %>%
+  mutate(Specific_Var = Env_Var, Analysis_Group = "Env_Main")
+
+# 1.2 Main Effect (Traits)
+df_trait <- comm_raw_results %>% 
+  filter(Component %in% c("Above", "Below")) %>%
+  mutate(
+    Specific_Var = ifelse(Component=="Above", Trait_Above, Trait_Below),
+    Analysis_Group = "Trait_Main"
+  )
+
+# 1.3 TT Interaction (Split to Traits)
+df_tt <- comm_raw_results %>%
+  filter(Component == "TT") %>%
+  pivot_longer(cols = c(Trait_Above, Trait_Below), values_to = "Specific_Var") %>%
+  mutate(Value = Value / 2, Analysis_Group = "TT_Interaction")
+
+# 1.4 TE Interaction (Split to Traits)
+df_te_trait <- comm_raw_results %>%
+  filter(Component == "TE") %>%
+  pivot_longer(cols = c(Trait_Above, Trait_Below), values_to = "Specific_Var") %>%
+  mutate(Value = Value / 2, Analysis_Group = "TE_Trait") # 假设均分给性状端
+
+# 1.5 TE Interaction (Split to Env) -> 这里是之前漏掉的关键！
+# TE 的贡献完全归因于环境因子 (用于分析环境在交互中的重要性)
+# 注意：这里 Value 不除以 2，因为从环境角度看，这是该环境因子参与的所有交互的总和
+# 或者为了与性状端量级一致，也可以 /2，取决于“相对重要性”的定义。
+# 为了画图量级一致，建议保持一致的处理 (比如都 /2)，或者都用原始值。
+# 之前的图中 TE_Env 量级和 TE_Trait 差不多，说明可能都除以了2。
+# 我们这里统一：都除以 2，代表“交互作用的一半归因于一方”。
+df_te_env <- comm_raw_results %>%
+  filter(Component == "TE") %>%
+  mutate(
+    Specific_Var = Env_Var, 
+    Value = Value / 2, 
+    Analysis_Group = "TE_Env"
+  )
+
+# 合并所有数据用于分析
+df_all_analysis <- bind_rows(
+  df_env %>% select(Year, Combination_ID, Value, Specific_Var, Analysis_Group),
+  df_trait %>% select(Year, Combination_ID, Value, Specific_Var, Analysis_Group),
+  df_tt %>% select(Year, Combination_ID, Value, Specific_Var, Analysis_Group),
+  df_te_trait %>% select(Year, Combination_ID, Value, Specific_Var, Analysis_Group),
+  df_te_env %>% select(Year, Combination_ID, Value, Specific_Var, Analysis_Group)
+) %>%
+  mutate(
+    Year_Num = case_when(Year == "1st" ~ 1, Year == "2nd" ~ 2, Year == "3rd" ~ 3),
+    Combination_ID = as.factor(Combination_ID),
+    Value = pmax(0, Value) # 防御负值
+  )
+
+# ==============================================================================
+# 2. 统计检验 (LMM) - 覆盖所有 5 个分析组
+# ==============================================================================
+run_trend_test_complete <- function(data) {
+  unique_groups <- unique(data$Analysis_Group)
+  results_list <- list()
+  
+  for (grp in unique_groups) {
+    sub_data <- data %>% filter(Analysis_Group == grp)
+    unique_vars <- unique(sub_data$Specific_Var)
+    
+    for (var in unique_vars) {
+      var_data <- sub_data %>% filter(Specific_Var == var)
+      
+      if (var(var_data$Value, na.rm=TRUE) > 1e-10) {
+        mod <- tryCatch({
+          lmer(Value ~ Year_Num + (1 | Combination_ID), data = var_data)
+        }, error = function(e) NULL)
+        
+        sig_mark <- ""
+        if (!is.null(mod)) {
+          res <- broom.mixed::tidy(mod, effects = "fixed") %>% filter(term == "Year_Num")
+          if (nrow(res) > 0 && !is.na(res$p.value)) {
+            p <- res$p.value
+            if (p < 0.001) sig_mark <- "***"
+            else if (p < 0.01) sig_mark <- "**"
+            else if (p < 0.05) sig_mark <- "*"
+            else if (p < 0.1) sig_mark <- "."
+          }
+        }
+        
+        results_list[[paste(grp, var, sep="_")]] <- data.frame(
+          Analysis_Group = grp, Specific_Var = var, Label = sig_mark, stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  return(do.call(rbind, results_list))
+}
+
+print("Running Complete LMM Tests...")
+sig_results_complete <- run_trend_test_complete(df_all_analysis)
+print(sig_results_complete %>% filter(Label != ""))
+
+# ==============================================================================
+# 3. 绘图数据准备
+# ==============================================================================
+plot_data_agg <- df_all_analysis %>%
+  group_by(Year, Analysis_Group, Specific_Var) %>%
+  summarise(
+    Mean = mean(Value, na.rm=TRUE),
+    SE = sd(Value, na.rm=TRUE)/sqrt(n()),
+    .groups = "drop"
+  )
+
+
+
+### 测试不同的变量的时间格局
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(purrr)
+
+# 1) 确保变量类型正确
+df_all_analysis2 <- df_all_analysis %>%
+  mutate(
+    Year = factor(Year, levels = c("1st","2nd","3rd")),
+    Year_Num = as.numeric(Year_Num),
+    Combination_ID = factor(Combination_ID),
+    Analysis_Group = factor(Analysis_Group),
+    Specific_Var = factor(Specific_Var)
+  )
+
+# 2) 对每个 group × var 拟合：Value ~ Year_Num + (1|Combination_ID)
+fit_one <- function(dat) {
+  # 如果某个子集缺少年份或样本不足，则返回 NA
+  if (nrow(dat) < 6 || length(unique(dat$Year_Num)) < 2) {
+    return(tibble(
+      slope = NA_real_, se = NA_real_, df = NA_real_,
+      t = NA_real_, p = NA_real_, ci_low = NA_real_, ci_high = NA_real_
+    ))
+  }
+
+  m <- lmer(Value ~ Year_Num + (1 | Combination_ID), data = dat, REML = TRUE)
+
+  co <- summary(m)$coefficients
+  slope <- co["Year_Num", "Estimate"]
+  se    <- co["Year_Num", "Std. Error"]
+  df    <- co["Year_Num", "df"]
+  tval  <- co["Year_Num", "t value"]
+  pval  <- co["Year_Num", "Pr(>|t|)"]
+
+  # Wald 95% CI（快速且足够用于趋势汇总；如需更稳健可用 profile）
+  ci <- suppressMessages(confint(m, parm = "Year_Num", method = "Wald"))
+
+  tibble(
+    slope = slope, se = se, df = df, t = tval, p = pval,
+    ci_low = ci[1], ci_high = ci[2]
+  )
+}
+
+# 3) 批量运行并输出整洁结果表
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+library(purrr)
+
+# 1) 确保变量类型正确
+df_all_analysis2 <- df_all_analysis %>%
+  mutate(
+    Year_Num = as.numeric(Year_Num),
+    Combination_ID = factor(Combination_ID),
+    Analysis_Group = factor(Analysis_Group),
+    Specific_Var = factor(Specific_Var)
+  )
+
+# 2) 单个子集拟合并提取所需统计量
+fit_extract <- function(dat) {
+
+  # 数据不足时跳过
+  if (nrow(dat) < 6 || length(unique(dat$Year_Num)) < 2) {
+    return(tibble(
+      slope = NA_real_,
+      se = NA_real_,
+      p = NA_real_,
+      star = NA_character_,
+      R2 = NA_real_
+    ))
+  }
+
+  m <- lmer(Value ~ Year_Num + (1 | Combination_ID),
+            data = dat, REML = TRUE)
+
+  co <- summary(m)$coefficients["Year_Num", ]
+
+  slope <- co["Estimate"]
+  se    <- co["Std. Error"]
+  pval  <- co["Pr(>|t|)"]
+
+  # 显著性星号
+  star <- case_when(
+    pval < 0.001 ~ "***",
+    pval < 0.01  ~ "**",
+    pval < 0.05  ~ "*",
+    TRUE ~ ""
+  )
+
+  # marginal R2（固定效应解释度）
+  R2m <- r.squaredGLMM(m)[1]
+
+  tibble(
+    slope = slope,
+    se = se,
+    p = pval,
+    star = star,
+    R2 = R2m
+  )
+}
+
+# 3) 批量运行：group × var
+res_trend_minimal <- df_all_analysis2 %>%
+  group_by(Analysis_Group, Specific_Var) %>%
+  group_modify(~ fit_extract(.x)) %>%
+  ungroup() %>%
+  arrange(Analysis_Group, p)
+
+res_trend_minimal
+
+
+
+## 分组测试时间趋势：
+library(dplyr)
+library(lme4)
+library(lmerTest)
+
+df0 <- df_all_analysis %>%
+  mutate(
+    Year_Num = as.numeric(Year_Num),
+    Combination_ID = factor(Combination_ID),
+    Specific_Var = factor(Specific_Var),
+    Analysis_Group = factor(Analysis_Group)
+  )
+
+fit_common_trend <- function(dat) {
+  m <- lmer(Value ~ Year_Num + (1 | Combination_ID) + (1 | Specific_Var),
+            data = dat, REML = TRUE)
+
+  co <- summary(m)$coefficients["Year_Num", ]
+  out <- data.frame(
+    slope = unname(co["Estimate"]),
+    se    = unname(co["Std. Error"]),
+    p     = unname(co["Pr(>|t|)"])
+  )
+  out$star <- ifelse(out$p < 0.001, "***",
+                     ifelse(out$p < 0.01, "**",
+                            ifelse(out$p < 0.05, "*", "")))
+  return(list(model = m, stats = out))
+}
+
+dat_above <- df0 %>%
+  filter(Analysis_Group == "Trait_Main",
+         Specific_Var %in% c("Above_PC1", "Above_PC2", "Above_PC3"))
+
+res_above <- fit_common_trend(dat_above)
+
+res_above$stats   # slope / se / p / star
+summary(res_above$model)
+
+dat_below <- df0 %>%
+  filter(Analysis_Group == "Trait_Main",
+         Specific_Var %in% c("Below_PC1", "Below_PC2"))
+
+res_below <- fit_common_trend(dat_below)
+
+res_below$stats
+summary(res_below$model)
+
+dat_env3 <- df0 %>%
+  filter(Analysis_Group == "Env_Main",
+         Specific_Var %in% c("Light", "Moisture", "AP"))
+
+res_env3 <- fit_common_trend(dat_env3)
+res_env3$stats
+summary(res_env3$model)
+
+
+dat_tt_above <- df0 %>%
+  filter(
+    Analysis_Group == "TT_Interaction",
+    Specific_Var %in% c(
+      "Above_PC1",
+      "Above_PC2",
+      "Above_PC3",
+      "Below_PC1",
+      "Below_PC2"
+    )
+  )
+m_tt_above <- lmer(
+  Value ~ Year_Num + (1 | Combination_ID) + (1|Specific_Var),
+  data = dat_tt_above,
+  REML = TRUE
+)
+
+summary(m_tt_above)
+
+# 标签准备
+label_data <- plot_data_agg %>%
+  group_by(Analysis_Group, Specific_Var) %>%
+  summarise(Max_Y = max(Mean + SE, na.rm=TRUE), .groups="drop") %>%
+  left_join(sig_results_complete, by = c("Analysis_Group", "Specific_Var")) %>%
+  mutate(Year = "2nd", Label = ifelse(is.na(Label), "", Label))
+
+# ==============================================================================
+# 4. 绘图函数与拼图
+# ==============================================================================
+plot_group <- function(grp_name, title, remove_x=FALSE) {
+  d <- plot_data_agg %>% filter(Analysis_Group == grp_name)
+  l <- label_data %>% filter(Analysis_Group == grp_name)
+  
+  # 强制排序 Env
+  if (grepl("Env", grp_name)) {
+    levs <- c("Light", "Moisture", "AP", "Compete")
+    d$Specific_Var <- factor(d$Specific_Var, levels = levs)
+    l$Specific_Var <- factor(l$Specific_Var, levels = levs)
+  }
+  
+  p <- ggplot(d, aes(x = Specific_Var, y = Mean, color = Year, group = Year)) +
+    geom_errorbar(aes(ymin = pmax(0, Mean - SE), ymax = Mean + SE), 
+                  width = 0.2, position = position_dodge(width = 0.6)) +
+    geom_point(position = position_dodge(width = 0.6), size = 3) +
+    geom_text(data = l, aes(x = Specific_Var, y = Max_Y * 1.15, label = Label), 
+              inherit.aes = FALSE, size = 5, color = "black", fontface = "bold") +
+    scale_color_manual(values = c("1st"="#FFE7CC", "2nd"="#F8CBA6", "3rd"="#E08E6D")) +
+    labs(title = title, x = NULL, y = "Relative Importance") +
+    theme_Publication() +
+    theme(legend.position = "none")
+  
+  if (remove_x) p <- p + theme(axis.text.x = element_blank())
+  else p <- p + theme(axis.text.x = element_text(angle=30, hjust=1, color="black"))
+  
+  return(p)
+}
+
+## ============================================================
+## Build panels (a–e) with full x-axis labels for traits and envs
+## ============================================================
+
+library(ggplot2)
+
+## ---- 1) Full labels ----
+trait_x_labels <- c(
+  "Above_PC1" = "Leaf economics\n(Above_PC1)",
+  "Above_PC2" = "Plant size\n(Above_PC2)",
+  "Above_PC3" = "Leaf area\n(Above_PC3)",
+  "Below_PC1" = "Root collaboration\n(Below_PC1)",
+  "Below_PC2" = "Root economics\n(Below_PC2)"
+)
+
+env_x_labels <- c(
+  "Light"    = "Light",
+  "Moisture" = "Soil moisture",
+  "AP"       = "Soil phosphorus",
+  "Compete"  = "Competition"
+)
+
+## ---- 2) Apply x-axis helper functions ----
+apply_trait_x_axis <- function(p, angle = 35, hjust = 1, vjust = 1, size = 9.5) {
+  p +
+    scale_x_discrete(labels = trait_x_labels) +
+    theme(
+      axis.text.x = element_text(
+        angle = angle, hjust = hjust, vjust = vjust,
+        size = size, colour = "black"
+      )
+    )
+}
+
+apply_env_x_axis <- function(p, angle = 0, hjust = 0.5, vjust = 1, size = 9.5) {
+  p +
+    scale_x_discrete(labels = env_x_labels) +
+    theme(
+      axis.text.x = element_text(
+        angle = angle, hjust = hjust, vjust = vjust,
+        size = size, colour = "black"
+      )
+    )
+}
+
+## ---- 3) Common margins (avoid repetition) ----
+panel_margin <- theme(plot.margin = margin(t = 1, r = 1, b = 4, l = 1, unit = "pt"))
+
+## ---- 4) Generate panels ----
+p_a <- plot_group("Trait_Main", "(a) Trait Main Effect", remove_x = TRUE) +
+  ylab(NULL) + panel_margin
+
+
+
+
+p_b <- plot_group("TT_Interaction", "(b) Trait × Trait Interaction", remove_x = TRUE) +
+  panel_margin
+
+## (c) x = trait -> full trait labels
+p_c <- plot_group("TE_Trait", "(c) Trait × Env Interaction (by Trait)", remove_x = FALSE) +
+  ylab(NULL) + panel_margin
+p_c <- apply_trait_x_axis(p_c, angle = 35, hjust = 0.8, size = 9.5)
+
+p_d <- plot_group("Env_Main", "(d) Env Main Effect", remove_x = TRUE) +
+  ylab(NULL) + panel_margin
+
+## (e) x = env -> full env labels
+p_e <- plot_group("TE_Env", "(e) Trait × Env Interaction (by Env)", remove_x = FALSE) +
+  ylab(NULL) + panel_margin
+p_e <- apply_env_x_axis(p_e, angle = 15, hjust = 0.8, size = 9.5)
+
+# 拼图
+fig4a_e <- (p_a / p_b / p_c) | (p_d / p_e + plot_layout(heights = c(1, 1)))
+fig4a_e <- fig4a_e + plot_layout(widths = c(1.3, 1), guides = "collect") & theme(legend.position = "bottom")
+
+p_a1 <- plot_group("Trait_Main", "(a) Trait Main Effect", remove_x = TRUE) +
+  ylab(NULL) + panel_margin+ylim(c(0,0.11))
+
+library(eoffice)
+topptx(p_a1,filename = "02_output_results_new/figs/fig4a1.pptx", width = 2, height = 1)
+
+```
+
+## Species-level
+```{r}
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# ==============================================================================
+# 1. 定义核心分解函数
+# ==============================================================================
+decompose_triplet <- function(dat, t_a, t_b, e_v) {
+  # 简化的模型公式 (注意：物种水平通常不需要 (1|Nenv)，除非有多个环境)
+  # 这里保留 (1|Nenv) 以防数据结构确实包含嵌套环境
+  f1 <- paste("RGR_scale ~", e_v, "+ (1|Nenv)")
+  f2 <- paste("RGR_scale ~", e_v, "+", t_a, "+ (1|Nenv)")
+  f3 <- paste("RGR_scale ~", e_v, "+", t_a, "+", t_b, "+ (1|Nenv)")
+  f4 <- paste("RGR_scale ~", e_v, "+", t_a, "+", t_b, "+", t_a,":",t_b, "+ (1|Nenv)")
+  f5 <- paste("RGR_scale ~", e_v, "+", t_a, "+", t_b, "+", t_a,":",t_b, "+", t_a,":",e_v, "+", t_b,":",e_v, "+ (1|Nenv)")
+  
+  get_r2 <- function(f) {
+    mod <- tryCatch({
+      lmer(as.formula(f), data = dat, REML = FALSE, control = lmerControl(optimizer = "bobyqa"))
+    }, error = function(e) NULL, warning = function(w) NULL)
+    
+    if (is.null(mod)) return(0)
+    
+    val <- tryCatch({
+      r2_out <- MuMIn::r.squaredGLMM(mod)
+      if (is.matrix(r2_out)) r2_out[1, "R2m"] else r2_out["R2m"]
+    }, error = function(e) 0)
+    return(if (is.na(val)) 0 else as.numeric(val))
+  }
+  
+  r2_vec <- c(M1=get_r2(f1), M2=get_r2(f2), M3=get_r2(f3), M4=get_r2(f4), M5=get_r2(f5))
+  r2_vec[is.na(r2_vec)] <- 0
+  r2_vec <- cummax(r2_vec) # 确保递增
+  
+  total_r2 <- r2_vec["M5"]
+  if(is.na(total_r2) || total_r2 < 0.0001) return(rep(0, 5)) 
+  
+  incr <- c(
+    Env   = r2_vec["M1"],
+    Above = r2_vec["M2"] - r2_vec["M1"],
+    Below = r2_vec["M3"] - r2_vec["M2"],
+    TT    = r2_vec["M4"] - r2_vec["M3"],
+    TE    = r2_vec["M5"] - r2_vec["M4"]
+  )
+  return(pmax(0, incr)) # 确保非负
+}
+
+# ==============================================================================
+# 2. 准备循环变量
+# ==============================================================================
+# 确保使用 RGR_scale (标准化后的生长速率)
+above_traits <- c("Above_PC1", "Above_PC2", "Above_PC3")
+below_traits <- c("Below_PC1", "Below_PC2")
+env_vars     <- c("Light", "Moisture", "AP", "Compete") # 注意 Compete 列名
+combinations <- expand.grid(Above = above_traits, Below = below_traits, Env = env_vars, stringsAsFactors = FALSE)
+
+year_datasets <- list("1st" = tda_1st, "2nd" = tda_2nd, "3rd" = tda_3rd)
+species_list <- unique(tda_1st$sp)
+
+results_list <- list()
+counter <- 1
+
+for (year_name in names(year_datasets)) {
+  current_dat <- year_datasets[[year_name]]
+  
+  for (sp_name in species_list) {
+    sp_dat <- current_dat[current_dat$sp == sp_name, ]
+  
+    if (nrow(sp_dat) < 15) next 
+    for (i in 1:nrow(combinations)) {
+      raw_incr <- decompose_triplet(sp_dat, combinations$Above[i], combinations$Below[i], combinations$Env[i])
+      total_r2 <- sum(raw_incr, na.rm = TRUE)
+      
+      if(total_r2 > 0.001) {
+
+        rel_contrib <- raw_incr / total_r2
+        results_list[[counter]] <- data.frame(
+          Year = year_name,
+          Species = sp_name,
+          Combination_ID = i,
+          Trait_Above = combinations$Above[i],
+          Trait_Below = combinations$Below[i],
+          Env_Var = combinations$Env[i],
+          Val_Env   = as.numeric(rel_contrib[1]),
+          Val_Above = as.numeric(rel_contrib[2]),
+          Val_Below = as.numeric(rel_contrib[3]),
+          Val_TT    = as.numeric(rel_contrib[4]),
+          Val_TE    = as.numeric(rel_contrib[5]),
+          Total_R2 = total_r2,
+          stringsAsFactors = FALSE
+        )
+        counter <- counter + 1
+      }
+    }
+  }
+}
+print("Loop Completed.")
+species_raw_detailed <- bind_rows(results_list)
+
+df_community <- comm_raw_results %>%
+  mutate(
+    Species = "Community",
+    Level = "Community") %>%
+  select(Year, Level, Species, Combination_ID, Component, Value)%>%
+  mutate(
+    Component_Label = case_when(
+      Component == "Env"   ~ "Environment",
+      Component == "Above" ~ "Above-ground",
+      Component == "Below" ~ "Below-ground",
+      Component == "TT"    ~ "Trait*Trait",
+      Component == "TE"    ~ "Trait*Env",
+      TRUE                 ~ Component
+    ),
+    Component_Label = factor(Component_Label, 
+       levels = c("Environment", "Above-ground", "Below-ground", "Trait*Trait", "Trait*Env")),
+    # 年份数值化
+    Year_Num = case_when(
+      Year == "1st" ~ 1,
+      Year == "2nd" ~ 2,
+      Year == "3rd" ~ 3
+    )
+  )
+
+df_species <- species_raw_detailed %>%
+  select(Year, Species, Combination_ID, Val_Env, Val_Above, Val_Below, Val_TT, Val_TE) %>%
+  pivot_longer(
+    cols = starts_with("Val_"),
+    names_to = "Component",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Level = "Species",
+    Component = recode(Component,
+      "Val_Env"   = "Env",
+      "Val_Above" = "Above",
+      "Val_Below" = "Below",
+      "Val_TT"    = "TT",
+      "Val_TE"    = "TE"
+    )) %>%
+  select(Year,Level, Species, Combination_ID, Component, Value)%>%
+  mutate(
+    # 映射全称标签
+    Component_Label = case_when(
+      Component == "Env"   ~ "Environment",
+      Component == "Above" ~ "Above-ground",
+      Component == "Below" ~ "Below-ground",
+      Component == "TT"    ~ "Trait*Trait",
+      Component == "TE"    ~ "Trait*Env",
+      TRUE                 ~ Component
+    ),
+    # 设置因子顺序
+    Component_Label = factor(Component_Label, 
+       levels = c("Environment", "Above-ground", "Below-ground", "Trait*Trait", "Trait*Env")),
+    # 年份数值化
+    Year_Num = case_when(
+      Year == "1st" ~ 1,
+      Year == "2nd" ~ 2,
+      Year == "3rd" ~ 3
+    )
+  )
+
+
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+
+df_species2 <- df_species %>%
+  mutate(
+    Species = factor(Species),
+    Combination_ID = factor(Combination_ID),
+    Component = factor(Component)
+  )
+
+fit_component_trend <- function(dat) {
+
+  m <- lmer(
+    Value ~ Year_Num + (1 | Species) + (1 | Combination_ID),
+    data = dat,
+    REML = TRUE
+  )
+
+  co <- summary(m)$coefficients["Year_Num", ]
+
+  r2 <- r.squaredGLMM(m)[1]  # marginal R2
+
+  tibble(
+    slope = unname(co["Estimate"]),
+    se    = unname(co["Std. Error"]),
+    p     = unname(co["Pr(>|t|)"]),
+    star  = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      p < 0.1   ~ ".",
+      TRUE      ~ ""
+    ),
+    R2 = r2
+  )
+}
+
+res_species_component <- df_species2 %>%
+  group_by(Component, Component_Label) %>%
+  group_modify(~ fit_component_trend(.x)) %>%
+  ungroup()
+res_species_component
+
+
+my_colors <- c(
+  "Above-ground" = "#A5B68D",
+  "Below-ground" = "#AB886D",
+  "Trait*Trait"  = "#FFE1AF",
+  "Environment"  = "#7C93C3",
+  "Trait*Env"    = "#C2D9FF"
+)
+
+
+level_order <- c("Above-ground", "Below-ground", "Trait*Trait", "Environment", "Trait*Env")
+df_species$Component_Label <- factor(df_species$Component_Label, levels = level_order)
+df_community$Component_Label <- factor(df_community$Component_Label, levels = level_order)
+
+my_colors <- c(
+  "Environment"  = "#7C93C3",
+  "Above-ground" = "#A5B68D",
+  "Below-ground" = "#AB886D",
+  "Trait*Trait"  = "#FFE1AF",
+  "Trait*Env"    = "#C2D9FF")
+p_ac <- ggplot(df_community, aes(x = Year_Num, y = Value, color = Component_Label, fill = Component_Label)) +
+  geom_jitter(width = 0.25, alpha = 0.2, size = 0.8, shape = 16) +
+  geom_smooth(aes(group=Component_Label),method = "lm", se = TRUE, size = 1, alpha = 0.3) +
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = my_colors) +
+  scale_x_continuous(breaks = 1:3, labels = c("1st", "2nd", "3rd")) +
+  labs(title = "(b) Temporal Trends", y = "Relative Importance", x = NULL) +
+  theme_classic(base_size = 13) + 
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  ) #+facet_wrap(~Component, nrow = 1, scales = "fixed")
+p_ac
+
+library(dplyr)
+library(broom)
+
+library(dplyr)
+library(broom)
+
+slopes_species <- df_species %>%
+  mutate(Year_Num = as.numeric(Year_Num)) %>%
+  group_by(Component_Label) %>%
+  do({
+    m <- lm(Value ~ Year_Num, data = .)
+    broom::tidy(m, conf.int = TRUE) %>% 
+      filter(term == "Year_Num")
+  }) %>%
+  ungroup() %>%
+  transmute(
+    Component_Label,
+    slope = estimate,
+    conf.low,
+    conf.high,
+    p.value)
+
+comp_levels <- levels(df_species$Component_Label)
+
+slopes_species <- slopes_species %>%
+  mutate(
+    Component_Label = factor(Component_Label, levels = comp_levels),
+    lab = sprintf("slope = %.3f", slope)   # 只显示 slope
+   
+  )
+
+y_top <- mean(df_species$Value, na.rm = TRUE)
+y_rng <- diff(range(df_species$Value, na.rm = TRUE))
+
+slopes_species <- slopes_species %>%
+  arrange(Component_Label) %>%
+  mutate(
+    x_pos = 2.95,  
+    y_pos = y_top - (row_number() - 1) * 0.03 * y_rng)
+
+library(ggplot2)
+
+p_bs <- ggplot(df_species, aes(x = Year_Num, y = Value, color = Component_Label, fill = Component_Label)) +
+  geom_smooth(aes(group = Component_Label), method = "lm", se = TRUE, linewidth = 1, alpha = 0.3) +
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = my_colors) +
+  scale_x_continuous(breaks = 1:3, labels = c("1st", "2nd", "3rd")) +
+  labs(title = "(d) Species-level", y = NULL, x = "Year") +
+  theme_Publication() + panel_margin +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  ) +
+  # 标注 slope：文字颜色跟线一致
+  geom_text(
+    data = slopes_species,
+    aes(x = x_pos, y = y_pos, label = lab, color = Component_Label),
+    inherit.aes = FALSE,
+    hjust = 1,        # 右对齐，贴近右侧
+    size = 3.2
+  ) +
+  # 给右侧一点空间避免文字被裁剪
+  coord_cartesian(xlim = c(1, 3.2))
+
+p_bs
+p_bs1 <- ggplot(df_species, aes(x = Year_Num, y = Value, color = Component_Label, fill = Component_Label)) +
+  #geom_jitter(width = 0.25, alpha = 0.2, size = 0.8, shape = 16) +
+  geom_smooth(aes(group=Component_Label),method = "lm", se = TRUE, size = 1, alpha = 0.3) +
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = my_colors) +
+  scale_x_continuous(breaks = 1:3, labels = c("1st", "2nd", "3rd")) +
+  labs(title = "(d) Species-level", y = NULL, x = "Year") +
+  theme_Publication() + panel_margin + 
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  ) 
+
+p_bs
+p_ac + p_bs +plot_layout(ncol=2)
+
+fig4a_f <- p_a + p_d + p_b + p_e + p_c + p_bs + plot_layout(ncol=2)
+fig4a_f <- fig4a_f + plot_layout(widths = c(1, 1), guides = "collect") & theme(legend.position = "bottom")
+
+print(fig4a_f )
+ggsave("02_output_results_new/figs/fig4_sp_var_imp_final.pdf", plot = fig4a_f, width = 7, height = 8)
+
+library(eoffice)
+topptx(fig4a_f,filename = "02_output_results_new/figs/fig4_sp_var_imp_final.pptx", width = 7, height = 8)
+
+
+# Figure 4
+fig4_a_panel <- p_a      # 图4(a): Trait Main Effect
+fig4_b_panel <- p_b      # 图4(b): Trait × Trait Interaction
+
+```
+
+# Results based on full model
+
+## Figure 5
+```{r}
+library(lmerTest)
+library(sjPlot)
+total_scaled_tda1 <- pcatraits_tda1
+lme_full <- lmerTest::lmer(
+  RGR ~ Above_PC1 + Above_PC2 + Above_PC3 + Below_PC1 + Below_PC2 +
+    Light + Moisture + AP + Compete + growth_time +
+    Above_PC1:growth_time + Above_PC2:growth_time + Above_PC3:growth_time + 
+    Below_PC1:growth_time + Below_PC2:growth_time +
+    Light:growth_time + Moisture:growth_time + AP:growth_time + Compete:growth_time +
+    Above_PC1:Below_PC1 +  Above_PC2:Below_PC1 +  Above_PC3:Below_PC1 +
+    Above_PC1:Below_PC2 +  Above_PC2:Below_PC2 +  Above_PC3:Below_PC2 +
+    Below_PC1:Below_PC2 + Above_PC1:Above_PC2 + Above_PC1:Above_PC3 + Above_PC2:Above_PC3 +
+    Above_PC1:Light + Above_PC1:Moisture + Above_PC1:AP + Above_PC1:Compete +
+    Above_PC2:Light + Above_PC2:Moisture + Above_PC2:AP + Above_PC2:Compete +
+    Above_PC3:Light + Above_PC3:Moisture + Above_PC3:AP + Above_PC3:Compete +
+    Below_PC1:Light + Below_PC1:Moisture + Below_PC1:AP + Below_PC1:Compete +
+    Below_PC2:Light + Below_PC2:Moisture + Below_PC2:AP + Below_PC2:Compete +
+    Above_PC1:Below_PC1:growth_time +  Above_PC2:Below_PC1:growth_time +  Above_PC3:Below_PC1:growth_time +
+    Above_PC1:Below_PC2:growth_time +  Above_PC2:Below_PC2:growth_time +  Above_PC3:Below_PC2:growth_time +
+    Below_PC1:Below_PC2:growth_time + Above_PC1:Above_PC2:growth_time + Above_PC1:Above_PC3:growth_time +
+    Above_PC2:Above_PC3:growth_time +
+    Above_PC1:Light:growth_time + Above_PC1:Moisture:growth_time + Above_PC1:AP:growth_time +
+    Above_PC1:Compete:growth_time +
+    Above_PC2:Light:growth_time + Above_PC2:Moisture:growth_time + Above_PC2:AP:growth_time +
+    Above_PC2:Compete:growth_time +
+    Above_PC3:Light:growth_time + Above_PC3:Moisture:growth_time + Above_PC3:AP:growth_time +
+    Above_PC3:Compete:growth_time +
+    Below_PC1:Light:growth_time + Below_PC1:Moisture:growth_time + Below_PC1:AP:growth_time +
+    Below_PC1:Compete:growth_time +
+    Below_PC2:Light:growth_time + Below_PC2:Moisture:growth_time + Below_PC2:AP:growth_time +
+    Below_PC2:Compete:growth_time +
+    (1 | sp) + (1 | Nenv),
+  data = total_scaled_tda1
+)
+tab_model(lme_full)
+## ============================================================
+## 1) Forest plot: robust term-finding (handles factor like Compete)
+## ============================================================
+
+forest_var_paired_sig_offset2 <- function(model,
+                                          vars,
+                                          var_labels,
+                                          time_var = "growth_time",
+                                          title = "(a)",
+                                          xlab = "Effect size",
+                                          y_offset = 0.15) {
+
+  cf <- fixef(model)
+  cn <- names(cf)
+  ci <- confint(model, method = "Wald")
+  sm <- summary(model)$coefficients
+
+  # helper: swap A:B <-> B:A
+  swap_term <- function(x) {
+    if (!grepl(":", x)) return(x)
+    paste(rev(strsplit(x, ":")[[1]]), collapse = ":")
+  }
+
+  # helper: find exact or swapped; if not found, allow prefix match for factor terms
+  find_term_robust <- function(var, type = c("Main", "Time")) {
+    type <- match.arg(type)
+
+    # target interaction term string (ideal)
+    term0 <- if (type == "Main") var else paste0(var, ":", time_var)
+
+    # 1) exact
+    if (term0 %in% cn) return(term0)
+    # 2) swapped
+    term1 <- swap_term(term0)
+    if (term1 %in% cn) return(term1)
+
+    # 3) prefix match (for factor-coded variables, e.g., Competeinter)
+    # Main: grep("^Compete", cn) but exclude ":" interactions
+    # Time: grep("^Compete.*:growth_time$" or "^growth_time:Compete", etc.)
+    if (type == "Main") {
+      hits <- grep(paste0("^", var), cn, value = TRUE)
+      hits <- hits[!grepl(":", hits)]
+      # remove intercept if someone passes "(Intercept)" by mistake
+      hits <- hits[hits != "(Intercept)"]
+      if (length(hits) == 1) return(hits)
+      if (length(hits) > 1) {
+        message("Multiple main-effect terms matched for ", var, ": ",
+                paste(hits, collapse = ", "),
+                ". Using the first: ", hits[1])
+        return(hits[1])
+      }
+    } else {
+      # allow both var:*:growth_time and growth_time:var*
+      hits <- grep(paste0("^", var, ".*:", time_var, "$"), cn, value = TRUE)
+      if (length(hits) == 0) {
+        hits <- grep(paste0("^", time_var, ":", var), cn, value = TRUE)
+      }
+      if (length(hits) == 1) return(hits)
+      if (length(hits) > 1) {
+        message("Multiple time-interaction terms matched for ", var, ": ",
+                paste(hits, collapse = ", "),
+                ". Using the first: ", hits[1])
+        return(hits[1])
+      }
+    }
+
+    stop("Term not found for variable '", var, "' (", type, ").\n",
+         "Available coefficient names include:\n",
+         paste(head(cn, 40), collapse = ", "),
+         if (length(cn) > 40) "\n... (truncated)" else "")
+  }
+
+  # build y-axis table
+  var_df <- tibble(
+    Var = vars,
+    label = var_labels,
+    y_base = rev(seq_along(vars))
+  )
+
+  # extract one row per (Var, Effect)
+  get_effect <- function(v, type) {
+    term <- find_term_robust(v, type)
+    tibble(
+      Var = v,
+      Effect = type,
+      term = term,
+      estimate = unname(cf[term]),
+      lower = ci[term, 1],
+      upper = ci[term, 2],
+      p = sm[term, "Pr(>|t|)"]
+    )
+  }
+
+  df <- bind_rows(
+    lapply(vars, get_effect, type = "Main"),
+    lapply(vars, get_effect, type = "Time")
+  ) %>%
+    left_join(var_df, by = "Var") %>%
+    mutate(
+      y = ifelse(Effect == "Main", y_base + y_offset, y_base - y_offset),
+      Sig = case_when(
+        p < 0.05 ~ "p < 0.05",
+        p < 0.10 ~ "0.05–0.10",
+        TRUE     ~ "p ≥ 0.10"
+      ),
+      Effect = factor(Effect, levels = c("Main", "Time"))
+    )
+
+  ggplot(df, aes(x = estimate, y = y)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_errorbarh(aes(xmin = lower, xmax = upper, colour = Effect),
+                   height = 0.12, linewidth = 0.6) +
+    geom_point(aes(fill = Sig, colour = Effect),
+               shape = 21, size = 2.2, stroke = 0.9) +
+    scale_fill_manual(
+      values = c("p < 0.05" = "black", "0.05–0.10" = "grey70", "p ≥ 0.10" = "white"),
+      name = "P value"
+    ) +
+    scale_color_manual(values = c("Main" = "black", "Time" = "#F3A26D"),
+                       labels = c("Main", "Var × Year"),
+                       name = NULL) +
+    scale_y_continuous(breaks = var_df$y_base, labels = var_df$label) +
+    labs(title = title, x = xlab, y = NULL) +
+    theme_Publication() + 
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background  = element_rect(fill = "white", colour = NA),
+
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+}
+
+vars9 <- c("Above_PC1","Above_PC2","Above_PC3","Below_PC1","Below_PC2",
+           "Light","Moisture","AP","Compete")
+
+labels9 <- c("Leaf economics\n(Above_PC1)",
+             "Plant size\n(Above_PC2)",
+             "Leaf area\n(Above_PC3)",
+             "Root collaboration\n(Below_PC1)",
+             "Root economics\n(Below_PC2)",
+             "Light intensity",
+             "Soil Moisture",
+             "Soil phosphorus",
+             "Competition")
+
+forest9 <- forest_var_paired_sig_offset2(
+  model = lme_full,
+  vars = vars9,
+  var_labels = labels9,
+  title = "(a)"
+)
+
+forest9
+
+```
+
+```{r,fig.height=9,fig.width=9}
+library(ggeffects)
+year_cols <- c("#F5E7C6","#F7B980","#DE802B")
+plot_trait_year_raw <- function(model_raw,
+                                data,
+                                trait,
+                                time_var = "growth_time",
+                                response_raw = "RGR",
+                                time_vals,
+                                time_labels = c("1st", "2nd", "3rd"),
+                                trait_range = NULL,
+                                title = NULL,
+                                colors = year_cols,
+                                show_ci = TRUE) {
+
+  pred <- ggpredict(
+    model_raw,
+    terms = c(
+      trait,
+      sprintf("%s [%s]", time_var, paste(time_vals, collapse = ", "))
+    ),
+    type = "fixed"
+  )
+
+  pred_df <- as.data.frame(pred) %>%
+    mutate(
+      Year = factor(group,
+                    levels = as.character(time_vals),
+                    labels = time_labels)
+    )
+
+  pal <- setNames(colors, time_labels)
+
+  p <- ggplot() +
+    geom_point(
+      data = data,
+      aes(x = .data[[trait]], y = .data[[response_raw]],colour = comp_year),
+      alpha  = 0.1,
+      size   = 0.2
+    )+
+    scale_color_manual(values = colors)
+
+  if (show_ci) {
+    p <- p + geom_ribbon(
+      data = pred_df,
+      aes(x = x, ymin = conf.low, ymax = conf.high, fill = Year),
+      alpha = 0.15,
+      colour = NA
+    )
+  }
+
+  p <- p +
+    geom_line(
+      data = pred_df,
+      aes(x = x, y = predicted, colour = Year),
+      linewidth = 1.2
+    ) +
+    scale_color_manual(values = pal, name = "Year") +
+    scale_fill_manual(values  = pal, name = "Year") +
+    labs(x = trait, y = "RGR", title = title) +
+    theme_Publication(base_size=11)+
+    theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10))+
+  scale_y_continuous(
+    labels = number_format(accuracy = 0.1)
+  ) +
+  scale_x_continuous(
+    breaks = function(x) floor(min(x)):ceiling(max(x))
+  )
+
+  if (!is.null(trait_range)) {
+    p <- p + coord_cartesian(xlim = trait_range, ylim = c(0, 1.2))
+  } else {
+    p <- p + coord_cartesian(ylim = c(0, NA))
+  }
+
+  return(p)
+}
+
+gt_vals <- sort(as.numeric(unique(total_scaled_tda1$growth_time)))
+gt_vals
+
+lme_plot_raw=lme_full
+
+trait_vars <- c(
+  "Above_PC1",
+  "Above_PC2",
+  "Above_PC3",
+  "Below_PC1",
+  "Below_PC2")
+
+trait_ranges <- lapply(
+  total_scaled_tda1[trait_vars],
+  function(x) quantile(x, probs = c(0.001,0.999), na.rm = TRUE))
+
+trait_ranges
+
+above_pc1_p <- plot_trait_year_raw(
+  model_raw   = lme_plot_raw,
+  data        = total_scaled_tda1,
+  trait       = "Above_PC1",
+  time_vals   = gt_vals,
+  trait_range = trait_ranges$Above_PC1,
+  title       = "(b)") + xlab("Leaf economics")+ylab(NULL)+
+  scale_x_continuous(breaks = c(-4,-2, 0, 2,4) )+
+  theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))
+
+
+above_pc2_p <- plot_trait_year_raw(lme_plot_raw, total_scaled_tda1, "Above_PC2",
+                                  time_vals = gt_vals,
+                                  trait_range = trait_ranges$Above_PC2,
+                                  title="(c)")+ylab(NULL) + xlab("Plant size") +
+  scale_x_continuous(breaks = c(-4,-2, 0, 2,4) )+
+  theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))
+
+
+above_pc3_p <- plot_trait_year_raw(lme_plot_raw, total_scaled_tda1, "Above_PC3",
+                                  time_vals = gt_vals,
+                                  trait_range = trait_ranges$Above_PC3,
+                                  title="(d)")+ylab(NULL)+ xlab("Leaf area")+
+  scale_x_continuous(breaks = c(-4,-2, 0, 2,4) )+
+  theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))
+
+
+below_pc1_p <- plot_trait_year_raw(lme_plot_raw, total_scaled_tda1, "Below_PC1",
+                                  time_vals = gt_vals,
+                                  trait_range = trait_ranges$Below_PC1,
+                                  title="(e)") + xlab("Root collaboration") +
+  scale_x_continuous(breaks = c(-4,-2, 0, 2,4) ) +
+  ylab(expression("Relative growth rate (RGR, log cm yr"^{-1}*")"))+
+  theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))
+
+
+below_pc2_p <- plot_trait_year_raw(lme_plot_raw, total_scaled_tda1, "Below_PC2",
+                                  time_vals = gt_vals,
+                                  trait_range = trait_ranges$Below_PC2,
+                                  title="(f)")+ylab(NULL)+ xlab("Root economics") +
+  scale_x_continuous(breaks = c(-4,-2, 0, 2,4) )+
+  theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))
+
+
+plot_env_year <- function(model,
+                          data,
+                          env,
+                          response = "RGR",
+                          time_var = "growth_time",
+                          time_vals,
+                          time_labels = c("1st", "2nd", "3rd"),
+                          env_range = NULL,         
+                          title = NULL,
+                          colors = year_cols,
+                          show_points = TRUE,
+                          point_alpha = 0.20,
+                          point_size  = 0.6,
+                          ci_alpha = 0.12) {
+
+  pred <- ggpredict(
+    model,
+    terms = c(
+      env,
+      sprintf("%s [%s]", time_var, paste(time_vals, collapse = ", "))
+    ),
+    type = "fixed"
+  )
+
+  pred_df <- as.data.frame(pred) %>%
+    mutate(
+      Year = factor(group,
+                    levels = as.character(time_vals),
+                    labels = time_labels)
+    )
+
+  pal <- setNames(colors, time_labels)
+
+  p <- ggplot()
+  if (show_points) {
+    p <- p + 
+    geom_point(
+      data = data,
+      aes(x = .data[[env]], y = .data[[response]],colour = comp_year),
+      alpha  = 0.1,
+      size   = 0.2
+    )+scale_color_manual(values = colors)
+
+  }
+  p <- p +
+    geom_ribbon(
+      data = pred_df,
+      aes(x = x, ymin = conf.low, ymax = conf.high, fill = Year),
+      alpha = ci_alpha,
+      colour = NA
+    ) +
+    geom_line(
+      data = pred_df,
+      aes(x = x, y = predicted, colour = Year),
+      linewidth = 1.2
+    ) +
+    scale_color_manual(values = pal, name = "Year") +
+    scale_fill_manual(values  = pal, name = "Year") +
+    labs(x = env, y = "RGR", title = title) +
+    theme_Publication(base_size = 11) +
+    theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10))+
+  scale_y_continuous(
+    labels = number_format(accuracy = 0.1)) 
+  # 坐标裁剪：env 范围 + y>=0（如果你用原始RGR，通常应>=0）
+  if (!is.null(env_range)) {
+    p <- p + coord_cartesian(xlim = env_range, ylim = c(0, NA))
+  } else {
+    p <- p + coord_cartesian(ylim = c(0, NA))
+  }
+
+  return(p)
+}
+
+lme_env_raw=lme_full
+env_ranges <- list(
+  Light    = quantile(total_scaled_tda1$Light,    c(0.05, 0.95), na.rm = TRUE),
+  Moisture = quantile(total_scaled_tda1$Moisture, c(0.05, 0.95), na.rm = TRUE),
+  AP       = quantile(total_scaled_tda1$AP,       c(0.05, 0.95), na.rm = TRUE)
+)
+p_light <- plot_env_year(
+  model = lme_env_raw,
+  data  = total_scaled_tda1,
+  env   = "Light",
+  time_vals = gt_vals,
+  env_range = env_ranges$Light,
+  title = "(g)")+ylab(NULL)+scale_x_continuous(breaks = c(-1, 0, 1) )+theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))+xlab("Light intensity")
+
+
+p_moist <- plot_env_year(
+  lme_env_raw, total_scaled_tda1,
+  env = "Moisture",
+  time_vals = gt_vals,
+  env_range = env_ranges$Moisture,
+  title = "(h)"
+)+theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))+ylab(NULL)+xlab("Soil moisture")
+
+p_ap <- plot_env_year(
+  lme_env_raw, total_scaled_tda1,
+  env = "AP",
+  time_vals = gt_vals,
+  env_range = env_ranges$AP,
+  title = "(i)"
+)+ylab(NULL)+theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))+xlab("Soil phosphorus")
+
+p_compete <- plot_env_year(
+  lme_env_raw, total_scaled_tda1,
+  env = "Compete",
+  time_vals = gt_vals,
+  title = "(j)",
+  show_points = TRUE
+)+ylab(NULL)+theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))+xlab("Competition")
+
+fig5a <- forest9 + theme_Publication(base_size = 11) +
+    theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 11))
+
+## ---- Left column: (a) only uses 70% height ----
+fig5a_short <- (
+  fig5a +
+    theme(
+      legend.position = "none" 
+    )
+) 
+
+## ---- Right block: 3×3 panels (unchanged) ----
+p_right <- (above_pc1_p + above_pc2_p + above_pc3_p +
+              below_pc1_p + below_pc2_p + p_light +
+              p_moist + p_ap + p_compete) +
+  plot_layout(ncol = 3) &
+  theme(legend.position = "bottom")
+
+## ---- Combine left + right with width ratio 1.2 : 3 ----
+fig5_all <- (fig5a_short | p_right) +
+  plot_layout(widths = c(1, 3), guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.text  = element_text(size = 10),
+    legend.title = element_text(size = 10)
+  )
+
+fig5_all
+
+ggsave(fig5_all,
+       file = "02_output_results_new/figs/fig5_trait_effect.pdf",
+       height = 6.1, width = 8.1, bg = "white")
+
+topptx(fig5_all,
+       filename = "02_output_results_new/figs/fig5_trait_effect.pptx",
+       height = 8, width = 10.5)
+```
+
+## Figure 6 Trait * Env * Year
+```{r,eval=FALSE}
+TE_terms <- c(
+  "Above_PC1:Moisture",
+  "Above_PC1:AP",
+  "Above_PC2:Light",
+  "Above_PC2:Moisture",
+  "Above_PC2:Competeinter",
+  "Above_PC3:Light",
+  "Above_PC3:AP",
+  "Above_PC3:Competeinter",
+  "Below_PC1:Light",
+  "Below_PC1:Competeinter",
+  "Below_PC2:Light",
+  "Below_PC2:Moisture"
+)
+pair_labels_TE <- c(
+  "Above_PC1:Moisture"     = "Leaf econ × Moisture",
+  "Above_PC1:AP"           = "Leaf econ × AP",
+  "Above_PC2:Light"        = "Plant size × Light",
+  "Above_PC2:Moisture"     = "Plant size × Moisture",
+  "Above_PC2:Competeinter" = "Plant size × Competition",
+  "Above_PC3:Light"        = "Leaf area × Light",
+  "Above_PC3:AP"           = "Leaf area × AP",
+  "Above_PC3:Competeinter" = "Leaf area × Competition",
+  "Below_PC1:Light"        = "Root collab × Light",
+  "Below_PC1:Competeinter" = "Root collab × Competition",
+  "Below_PC2:Light"        = "Root econ × Light",
+  "Below_PC2:Moisture"     = "Root econ × Moisture"
+)
+tab_model(lme_full)
+## Figure 6 Trait × Env × Year  (Forest plot)
+library(dplyr)
+library(ggplot2)
+
+forest_TE_paired_sig3 <- function(model,
+                                  TE_terms,
+                                  pair_labels,
+                                  time_var = "growth_time",
+                                  title = "Trait–environment interactions and their temporal change",
+                                  xlab  = "Effect size (estimate ± 95% CI)",
+                                  y_offset = 0.18,
+                                  col_TE = "black",
+                                  col_TETwitter = "#F3A26D") {
+
+  ## ---------- helpers ----------
+  swap_term <- function(x) {
+    if (!grepl(":", x)) return(x)
+    paste(rev(strsplit(x, ":")[[1]]), collapse = ":")
+  }
+
+  find_term <- function(term, names_vec) {
+    if (term %in% names_vec) return(term)
+    alt <- swap_term(term)
+    if (alt %in% names_vec) return(alt)
+    stop("Term not found: ", term)
+  }
+
+  sig_class <- function(p) {
+    dplyr::case_when(
+      p < 0.05 ~ "p < 0.05",
+      p < 0.10 ~ "0.05–0.10",
+      TRUE     ~ "p ≥ 0.10"
+    )
+  }
+
+  ## ---------- extract ----------
+  cf <- fixef(model)
+  ci <- confint(model, method = "Wald")
+  sm <- summary(model)$coefficients
+  pvals <- sm[, "Pr(>|t|)"]
+
+  y_map <- tibble(
+    TE = TE_terms,
+    label = pair_labels[TE_terms],
+    y_base = rev(seq_along(TE_terms))
+  )
+
+  get_row <- function(te, is_time = FALSE) {
+    term <- if (!is_time) te else paste0(te, ":", time_var)
+    term <- find_term(term, names(cf))
+    p <- unname(pvals[term])
+
+    tibble(
+      TE = te,
+      EffectType = ifelse(is_time, "TE × Year", "TE"),
+      estimate = unname(cf[term]),
+      lower = ci[term, 1],
+      upper = ci[term, 2],
+      p = p,
+      Sig = sig_class(p)
+    )
+  }
+
+  df <- bind_rows(
+    lapply(TE_terms, get_row, is_time = FALSE),
+    lapply(TE_terms, get_row, is_time = TRUE)
+  ) %>%
+    left_join(y_map, by = "TE") %>%
+    mutate(
+      y = ifelse(EffectType == "TE",
+                 y_base + y_offset,
+                 y_base - y_offset),
+      ## edge color encodes effect type only
+      Edge = ifelse(EffectType == "TE", col_TE, col_TETwitter)
+    )
+
+  ## ---------- plot ----------
+  ggplot(df, aes(x = estimate, y = y)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+
+    geom_errorbarh(
+      aes(xmin = lower, xmax = upper, colour = EffectType),
+      height = 0.15,
+      linewidth = 0.6
+    ) +
+
+    geom_point(
+      aes(fill = Sig, colour = EffectType),
+      shape = 21,
+      size = 2,
+      stroke = 0.9
+    ) +
+
+    ## fill = significance (same as Fig.5)
+    scale_fill_manual(
+      values = c(
+        "p < 0.05"  = "black",
+        "0.05–0.10" = "grey70",
+        "p ≥ 0.10"  = "white"
+      ),
+      name = "P value"
+    ) +
+
+    ## outline = effect type (black vs orange)
+    scale_colour_manual(
+      values = c("TE" = col_TE, "TE × Year" = col_TETwitter),
+      name = NULL,
+      labels = c("Trait × environment", "Trait × environment × year")
+    ) +
+
+    scale_y_continuous(
+      breaks = y_map$y_base,
+      labels = y_map$label
+    ) +
+
+    labs(title = title, x = xlab, y = NULL) +
+    theme_Publication()
+}
+
+## ---- run ----
+res_TE <- forest_TE_paired_sig3(
+  model = lme_full,
+  TE_terms = TE_terms,
+  pair_labels = pair_labels_TE,
+  time_var = "growth_time",
+  title = "Trait–environment interactions"
+)
+
+res_TE
+
+
+```
+
+## Figure 6 Trait * Trait * Year
+```{r,eval=FALSE}
+library(dplyr)
+library(ggplot2)
+
+forest_TT_paired_sig3 <- function(model,
+                                  TT_terms,
+                                  pair_labels,
+                                  time_var = "growth_time",
+                                  title = "Trait–trait interactions and their temporal change",
+                                  xlab  = "Effect size (estimate ± 95% CI)",
+                                  y_offset = 0.18,
+                                  col_TT = "black",
+                                  col_TTYear = "#F3A26D") {
+
+  ## ---------- helpers ----------
+  swap_term <- function(x) {
+    if (!grepl(":", x)) return(x)
+    paste(rev(strsplit(x, ":")[[1]]), collapse = ":")
+  }
+
+  find_term <- function(term, names_vec) {
+    if (term %in% names_vec) return(term)
+    alt <- swap_term(term)
+    if (alt %in% names_vec) return(alt)
+    stop("Term not found: ", term)
+  }
+
+  sig_class <- function(p) {
+    dplyr::case_when(
+      p < 0.05 ~ "p < 0.05",
+      p < 0.10 ~ "0.05–0.10",
+      TRUE     ~ "p ≥ 0.10"
+    )
+  }
+
+  ## ---------- extract ----------
+  cf <- fixef(model)
+  ci <- confint(model, method = "Wald")
+  sm <- summary(model)$coefficients
+  pvals <- sm[, "Pr(>|t|)"]
+
+  y_map <- tibble(
+    TT = TT_terms,
+    label = pair_labels[TT_terms],
+    y_base = rev(seq_along(TT_terms))
+  )
+
+  get_row <- function(tt, is_time = FALSE) {
+    term <- if (!is_time) tt else paste0(tt, ":", time_var)
+    term <- find_term(term, names(cf))
+    p <- unname(pvals[term])
+
+    tibble(
+      TT = tt,
+      EffectType = ifelse(is_time, "TT × Year", "TT"),
+      estimate = unname(cf[term]),
+      lower = ci[term, 1],
+      upper = ci[term, 2],
+      p = p,
+      Sig = sig_class(p)
+    )
+  }
+
+  df <- bind_rows(
+    lapply(TT_terms, get_row, is_time = FALSE),
+    lapply(TT_terms, get_row, is_time = TRUE)
+  ) %>%
+    left_join(y_map, by = "TT") %>%
+    mutate(
+      y = ifelse(EffectType == "TT",
+                 y_base + y_offset,
+                 y_base - y_offset),
+      EffectType = factor(EffectType, levels = c("TT", "TT × Year"))
+    )
+
+  ## ---------- plot ----------
+  ggplot(df, aes(x = estimate, y = y)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+
+    geom_errorbarh(
+      aes(xmin = lower, xmax = upper, colour = EffectType),
+      height = 0.12,
+      linewidth = 0.8
+    ) +
+
+    geom_point(
+      aes(fill = Sig, colour = EffectType),
+      shape = 21,
+      size = 2,
+      stroke = 0.9
+    ) +
+
+    ## fill = significance (same as Fig.5)
+    scale_fill_manual(
+      values = c(
+        "p < 0.05"  = "black",
+        "0.05–0.10" = "grey70",
+        "p ≥ 0.10"  = "white"
+      ),
+      name = "P value"
+    ) +
+
+    ## outline/errorbar = effect type (black vs orange)
+    scale_colour_manual(
+      values = c("TT" = col_TT, "TT × Year" = col_TTYear),
+      name = NULL,
+      labels = c("Trait × trait", "Trait × trait × year")
+    ) +
+
+    scale_y_continuous(
+      breaks = y_map$y_base,
+      labels = y_map$label
+    ) +
+
+    labs(title = title, x = xlab, y = NULL) +
+    theme_Publication()
+}
+
+## ===========================
+## 1) Define TT terms (unchanged)
+## ===========================
+TT_terms <- c(
+  "Above_PC1:Above_PC2",
+  "Above_PC1:Above_PC3",
+  "Above_PC1:Below_PC1",
+  "Above_PC1:Below_PC2",
+  "Above_PC2:Above_PC3",
+  "Above_PC2:Below_PC1",
+  "Above_PC2:Below_PC2",
+  "Above_PC3:Below_PC1",
+  "Above_PC3:Below_PC2",
+  "Below_PC1:Below_PC2"
+)
+
+pair_labels <- c(
+  "Above_PC1:Above_PC2" = "Leaf econ × Plant size",
+  "Above_PC1:Above_PC3" = "Leaf econ × Leaf area",
+  "Above_PC1:Below_PC1" = "Leaf econ × Root collab",
+  "Above_PC1:Below_PC2" = "Leaf econ × Root econ",
+  "Above_PC2:Above_PC3" = "Plant size × Leaf area",
+  "Above_PC2:Below_PC1" = "Plant size × Root collab",
+  "Above_PC2:Below_PC2" = "Plant size × Root econ",
+  "Above_PC3:Below_PC1" = "Leaf area × Root collab",
+  "Above_PC3:Below_PC2" = "Leaf area × Root econ",
+  "Below_PC1:Below_PC2" = "Root collab × Root econ"
+)
+
+## ===========================
+## 2) Run & plot
+## ===========================
+res_TT <- forest_TT_paired_sig3(
+  model = lme_full,
+  TT_terms = TT_terms,
+  pair_labels = pair_labels,
+  time_var = "growth_time",
+  title = "Trait–trait interactions"
+)
+
+res_TT
+
+res_TT+res_TE+plot_layout(ncol=2)
+```
+
+## Figure 6 TE/TT_selected
+```{r}
+library(dplyr)
+library(ggplot2)
+
+forest_TE_paired_sig_filter <- function(model,
+                                        TE_terms,
+                                        pair_labels,
+                                        time_var = "growth_time",
+                                        title = "Trait–environment interactions",
+                                        xlab  = "Effect size",
+                                        y_offset = 0.12,
+                                        col_TE = "black",
+                                        col_TEYear = "#F3A26D",
+                                        p_keep = 0.10) {
+
+  # --- helpers ---
+  swap_term <- function(x) {
+    if (!grepl(":", x)) return(x)
+    paste(rev(strsplit(x, ":")[[1]]), collapse = ":")
+  }
+  find_term <- function(term, names_vec) {
+    if (term %in% names_vec) return(term)
+    alt <- swap_term(term)
+    if (alt %in% names_vec) return(alt)
+    stop("Term not found: ", term)
+  }
+  sig_class <- function(p) {
+    case_when(
+      p < 0.05 ~ "p < 0.05",
+      p < 0.10 ~ "0.05–0.10",
+      TRUE     ~ "p ≥ 0.10"
+    )
+  }
+
+  # --- extract ---
+  cf <- fixef(model)
+  ci <- confint(model, method = "Wald")
+  sm <- summary(model)$coefficients
+  pvals <- sm[, "Pr(>|t|)"]
+
+  get_row <- function(te, is_time = FALSE) {
+    term <- if (!is_time) te else paste0(te, ":", time_var)
+    term <- find_term(term, names(cf))
+    p <- unname(pvals[term])
+
+    tibble(
+      Pair = te,
+      EffectType = ifelse(is_time, "TE × Year", "TE"),
+      estimate = unname(cf[term]),
+      lower = ci[term, 1],
+      upper = ci[term, 2],
+      p = p,
+      Sig = sig_class(p)
+    )
+  }
+
+  df <- bind_rows(
+    lapply(TE_terms, get_row, is_time = FALSE),
+    lapply(TE_terms, get_row, is_time = TRUE)
+  )
+
+  # --- filter: keep pair if at least one of (TE, TE×Year) has p < p_keep ---
+  keep_pairs <- df %>%
+    group_by(Pair) %>%
+    summarise(min_p = min(p, na.rm = TRUE), .groups = "drop") %>%
+    filter(min_p < p_keep) %>%
+    pull(Pair)
+
+  df <- df %>% filter(Pair %in% keep_pairs)
+
+  # if nothing left, fail gracefully
+  if (nrow(df) == 0) {
+    stop("No TE pairs passed the filter (min p < ", p_keep, ").")
+  }
+
+  # --- rebuild y map for filtered pairs (preserve original TE_terms order) ---
+  keep_pairs <- TE_terms[TE_terms %in% keep_pairs]
+  y_map <- tibble(
+    Pair = keep_pairs,
+    label = pair_labels[keep_pairs],
+    y_base = rev(seq_along(keep_pairs))
+  )
+
+  df <- df %>%
+    left_join(y_map, by = "Pair") %>%
+    mutate(
+      y = ifelse(EffectType == "TE", y_base + y_offset, y_base - y_offset),
+      EffectType = factor(EffectType, levels = c("TE", "TE × Year"))
+    )
+
+  ggplot(df, aes(x = estimate, y = y)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_errorbarh(
+      aes(xmin = lower, xmax = upper, colour = EffectType),
+      height = 0.15, linewidth = 0.6
+    ) +
+    geom_point(
+      aes(fill = Sig, colour = EffectType),
+      shape = 21, size = 2, stroke = 0.9
+    ) +
+    scale_fill_manual(
+      values = c(
+        "p < 0.05"  = "black",
+        "0.05–0.10" = "grey70",
+        "p ≥ 0.10"  = "white"
+      ),
+      name = "P value"
+    ) +
+    scale_colour_manual(
+      values = c("TE" = col_TE, "TE × Year" = col_TEYear),
+      name = NULL,
+      labels = c("Trait × environment", "Trait × environment × year")
+    ) +
+    scale_y_continuous(breaks = y_map$y_base, labels = y_map$label) +
+    labs(title = title, x = xlab, y = NULL) +
+    theme_Publication()
+}
+
+
+forest_TT_paired_sig_filter <- function(model,
+                                        TT_terms,
+                                        pair_labels,
+                                        time_var = "growth_time",
+                                        title = "Trait–trait interactions",
+                                        xlab  = "Effect size",
+                                        y_offset = 0.12,
+                                        col_TT = "black",
+                                        col_TTYear = "#F3A26D",
+                                        p_keep = 0.10) {
+
+  swap_term <- function(x) {
+    if (!grepl(":", x)) return(x)
+    paste(rev(strsplit(x, ":")[[1]]), collapse = ":")
+  }
+  find_term <- function(term, names_vec) {
+    if (term %in% names_vec) return(term)
+    alt <- swap_term(term)
+    if (alt %in% names_vec) return(alt)
+    stop("Term not found: ", term)
+  }
+  sig_class <- function(p) {
+    case_when(
+      p < 0.05 ~ "p < 0.05",
+      p < 0.10 ~ "0.05–0.10",
+      TRUE     ~ "p ≥ 0.10"
+    )
+  }
+
+  cf <- fixef(model)
+  ci <- confint(model, method = "Wald")
+  sm <- summary(model)$coefficients
+  pvals <- sm[, "Pr(>|t|)"]
+
+  get_row <- function(tt, is_time = FALSE) {
+    term <- if (!is_time) tt else paste0(tt, ":", time_var)
+    term <- find_term(term, names(cf))
+    p <- unname(pvals[term])
+
+    tibble(
+      Pair = tt,
+      EffectType = ifelse(is_time, "TT × Year", "TT"),
+      estimate = unname(cf[term]),
+      lower = ci[term, 1],
+      upper = ci[term, 2],
+      p = p,
+      Sig = sig_class(p)
+    )
+  }
+
+  df <- bind_rows(
+    lapply(TT_terms, get_row, is_time = FALSE),
+    lapply(TT_terms, get_row, is_time = TRUE)
+  )
+
+  # --- filter pairs ---
+  keep_pairs <- df %>%
+    group_by(Pair) %>%
+    summarise(min_p = min(p, na.rm = TRUE), .groups = "drop") %>%
+    filter(min_p < p_keep) %>%
+    pull(Pair)
+
+  df <- df %>% filter(Pair %in% keep_pairs)
+
+  if (nrow(df) == 0) {
+    stop("No TT pairs passed the filter (min p < ", p_keep, ").")
+  }
+
+  # preserve original order
+  keep_pairs <- TT_terms[TT_terms %in% keep_pairs]
+  y_map <- tibble(
+    Pair = keep_pairs,
+    label = pair_labels[keep_pairs],
+    y_base = rev(seq_along(keep_pairs))
+  )
+
+  df <- df %>%
+    left_join(y_map, by = "Pair") %>%
+    mutate(
+      y = ifelse(EffectType == "TT", y_base + y_offset, y_base - y_offset),
+      EffectType = factor(EffectType, levels = c("TT", "TT × Year"))
+    )
+
+  ggplot(df, aes(x = estimate, y = y)) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_errorbarh(
+      aes(xmin = lower, xmax = upper, colour = EffectType),
+      height = 0.12, linewidth = 0.8
+    ) +
+    geom_point(
+      aes(fill = Sig, colour = EffectType),
+      shape = 21, size = 2, stroke = 0.9
+    ) +
+    scale_fill_manual(
+      values = c(
+        "p < 0.05"  = "black",
+        "0.05–0.10" = "grey70",
+        "p ≥ 0.10"  = "white"
+      ),
+      name = "P value"
+    ) +
+    scale_colour_manual(
+      values = c("TT" = col_TT, "TT × Year" = col_TTYear),
+      name = NULL,
+      labels = c("Trait × trait", "Trait × trait × year")
+    ) +
+    scale_y_continuous(breaks = y_map$y_base, labels = y_map$label) +
+    labs(title = title, x = xlab, y = NULL) +
+    theme_Publication()
+}
+
+
+plot_3way_time2 <- function(model,
+                            data,
+                            x,                    
+                            mod,                  
+                            time = "growth_time",
+                            time_vals = c(-1.7059989,-0.2379998,1.2299992),
+                            time_labels = c("1st year", "2nd year", "3rd year"),
+                            mod_vals_num = c(-1, 0, 1),
+                            mod_labels_num = c("Low", "Medium", "High"),
+                            mod_vals_fac = NULL,           # 默认自动取 levels(data[[mod]])
+                            mod_labels_fac = NULL,         # 默认用 levels
+                            x_label = NULL,
+                            y_label = "Predicted RGR",
+                            title = NULL,
+                            palette = c("#B7B2D0", "#e3a561", "#448870"),
+                            ribbon_alpha = 0.18) {
+
+  suppressPackageStartupMessages({
+    library(ggeffects)
+    library(dplyr)
+    library(ggplot2)
+  })
+
+  stopifnot(x %in% names(data), mod %in% names(data), time %in% names(data))
+
+  if (is.null(x_label)) x_label <- x
+  if (is.null(title)) title <- sprintf("(%s × %s) × %s", x, mod, time)
+
+  mod_is_factor <- is.factor(data[[mod]]) || is.character(data[[mod]])
+
+  # --- 构造 ggpredict 的 terms ---
+  if (!mod_is_factor) {
+    # 连续：用数值水平
+    term_mod <- sprintf("%s [%s]", mod, paste(mod_vals_num, collapse = ", "))
+    group_levels <- as.character(mod_vals_num)
+    group_labels <- mod_labels_num
+    pal <- palette
+  } else {
+    # 因子：用水平名
+    if (is.null(mod_vals_fac)) mod_vals_fac <- levels(as.factor(data[[mod]]))
+    if (is.null(mod_labels_fac)) mod_labels_fac <- mod_vals_fac
+
+    term_mod <- sprintf("%s [%s]", mod, paste(mod_vals_fac, collapse = ", "))
+    group_levels <- mod_vals_fac
+    group_labels <- mod_labels_fac
+
+    # 因子只有两类时，取 palette 前两色
+    pal <- palette[seq_len(length(mod_vals_fac))]
+  }
+
+  term_time <- sprintf("%s [%s]", time, paste(time_vals, collapse = ", "))
+
+  
+  x_range <- as.numeric(quantile(data[[x]], probs = c(0.05, 0.95), na.rm = TRUE))
+  
+  pred <- ggpredict(model,
+                    terms = c(x, term_mod, term_time),
+                    type = "fixed")
+
+  df <- as.data.frame(pred) %>%
+    mutate(
+      Mod = factor(group, levels = group_levels, labels = group_labels),
+      Year = factor(facet, levels = as.character(time_vals), labels = time_labels)
+    )
+
+  ggplot(df, aes(x = x, y = predicted, colour = Mod, fill = Mod)) +
+    geom_line(linewidth = 1.1) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+                alpha = ribbon_alpha, colour = NA) +
+    facet_wrap(~Year, nrow = 1) +
+    scale_color_manual(values = pal) +
+    scale_fill_manual(values = pal) +
+    labs(x = x_label, y = y_label, colour = mod, fill = mod, title = title) +
+    coord_cartesian(xlim = x_range)+
+    theme_Publication()
+}
+
+plot_3way_time2 <- function(model,
+                            data,
+                            x,
+                            mod,
+                            time = "growth_time",
+                            time_vals = c(-1.7059989,-0.2379998,1.2299992),
+                            time_labels = c("1st year", "2nd year", "3rd year"),
+
+                            mod_vals_num = c(-1, 0, 1),
+                            mod_labels_num = c("Low", "Medium", "High"),
+
+                            mod_vals_fac = NULL,
+                            mod_labels_fac = NULL,
+
+                            x_label = NULL,
+                            y_label = "Predicted RGR",
+                            title = NULL,
+                            palette = c("#B7B2D0", "#e3a561", "#448870"),
+                            ribbon_alpha = 0.18,
+
+                            # ✅新增：散点设置
+                            response_raw = "RGR",
+                            show_points = TRUE,
+                            point_alpha = 0.10,
+                            point_size  = 1,
+                            points_by_mod = FALSE,     # TRUE=点按Mod分组上色；FALSE=点全灰
+                            time_round_digits = 6      # ✅关键：解决浮点匹配问题
+                            ) {
+
+  suppressPackageStartupMessages({
+    library(ggeffects)
+    library(dplyr)
+    library(ggplot2)
+  })
+
+  stopifnot(x %in% names(data), mod %in% names(data), time %in% names(data))
+  stopifnot(response_raw %in% names(data))
+
+  if (is.null(x_label)) x_label <- x
+  if (is.null(title)) title <- sprintf("(%s × %s) × %s", x, mod, time)
+
+  mod_is_factor <- is.factor(data[[mod]]) || is.character(data[[mod]])
+
+  # --- 构造 ggpredict 的 terms ---
+  if (!mod_is_factor) {
+    term_mod <- sprintf("%s [%s]", mod, paste(mod_vals_num, collapse = ", "))
+    group_levels <- as.character(mod_vals_num)
+    group_labels <- mod_labels_num
+    pal <- palette
+  } else {
+    if (is.null(mod_vals_fac)) mod_vals_fac <- levels(as.factor(data[[mod]]))
+    if (is.null(mod_labels_fac)) mod_labels_fac <- mod_vals_fac
+
+    term_mod <- sprintf("%s [%s]", mod, paste(mod_vals_fac, collapse = ", "))
+    group_levels <- mod_vals_fac
+    group_labels <- mod_labels_fac
+    pal <- palette[seq_len(length(mod_vals_fac))]
+  }
+
+  term_time <- sprintf("%s [%s]", time, paste(time_vals, collapse = ", "))
+
+  # x 轴用 5-95%
+  x_range <- as.numeric(quantile(data[[x]], probs = c(0.05, 0.95), na.rm = TRUE))
+
+  # ---- 预测 ----
+  pred <- ggpredict(model,
+                    terms = c(x, term_mod, term_time),
+                    type = "fixed")
+
+  df <- as.data.frame(pred) %>%
+    mutate(
+      Mod  = factor(group, levels = group_levels, labels = group_labels),
+      Year = factor(as.character(facet),
+                    levels = as.character(time_vals),
+                    labels = time_labels)
+    )
+
+  # =========================================================
+  # ✅ 给原始点贴 Year（按年分面）——用 round 防止浮点匹配失败
+  # =========================================================
+  year_map <- tibble(
+    gt = round(as.numeric(time_vals), time_round_digits),
+    Year = factor(gt, levels = round(as.numeric(time_vals), time_round_digits),
+                  labels = time_labels)
+  )
+
+  data_pt <- data %>%
+    mutate(gt = round(as.numeric(.data[[time]]), time_round_digits)) %>%
+    left_join(year_map, by = "gt") %>%
+    filter(!is.na(Year))
+
+  # （可选）点也按 Mod 分组着色（连续 mod 用三分位；因子 mod 用水平）
+  if (show_points && points_by_mod && !mod_is_factor) {
+    cuts <- quantile(data_pt[[mod]], probs = c(1/3, 2/3), na.rm = TRUE)
+    data_pt <- data_pt %>%
+      mutate(
+        Mod_pt = case_when(
+          .data[[mod]] <= cuts[1] ~ mod_labels_num[1],
+          .data[[mod]] <= cuts[2] ~ mod_labels_num[2],
+          TRUE ~ mod_labels_num[3]
+        ),
+        Mod_pt = factor(Mod_pt, levels = mod_labels_num)
+      )
+  }
+  if (show_points && points_by_mod && mod_is_factor) {
+    data_pt <- data_pt %>%
+      mutate(Mod_pt = factor(.data[[mod]], levels = group_levels, labels = group_labels))
+  }
+
+  # =========================================================
+  # ✅ 开始画图：先点，再CI，再线（点不会盖住线）
+  # =========================================================
+  p <- ggplot()
+
+  if (show_points) {
+    if (points_by_mod) {
+      p <- p + geom_point(
+        data = data_pt,
+        aes(x = .data[[x]], y = .data[[response_raw]], colour = Mod_pt),
+        alpha = point_alpha,
+        size  = point_size)
+    } else {
+      p <- p +
+        geom_point(
+        data = data_pt,
+        aes(x = .data[[x]], y = .data[[response_raw]]),
+        colour = "grey60",
+        alpha  = point_alpha,
+        size   = point_size
+      )
+    }
+  }
+
+  p <- p +
+    # geom_ribbon(
+    #   data = df,
+    #   aes(x = x, ymin = conf.low, ymax = conf.high, fill = Mod),
+    #   alpha = ribbon_alpha, colour = NA
+    # ) +
+    geom_line(
+      data = df,
+      aes(x = x, y = predicted, colour = Mod),
+      linewidth = 1.1
+    ) +
+    facet_wrap(~Year, nrow = 1) +
+    scale_color_manual(values = pal) +
+    scale_fill_manual(values = pal) +
+    labs(x = x_label, y = y_label, colour = mod, fill = mod, title = title) +
+    coord_cartesian(xlim = x_range) +
+    theme_Publication() +
+  theme(
+    strip.background = element_rect(fill = "white", colour = NA),
+    strip.text       = element_text(colour = "black")
+  )
+
+  return(p)
+}
+
+
+p_tt1 <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Above_PC1",
+  mod = "Below_PC2",
+  mod_vals_num = c(-1.5, 0, 1.5),
+  mod_labels_num = c("low", "Medium", "high plant size"),
+  x_label = "Leaf economics (Above_PC1)",
+  title = "(c) Leaf economics × Root economics")+ylim(c(0,0.7))+theme(legend.position = "none")+
+  theme(plot.margin = margin(t = 1, r = 1, b = 4, l = 1, unit = "pt"))
+p_tt1
+
+p_bpc2_m <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Below_PC2",
+  mod = "Moisture",
+  mod_vals_num = c(-1.5, 0, 1.5),
+  mod_labels_num = c("Low", "Medium", "High light"),
+  x_label = "Root economics (Below_PC2)",
+  title = "(d) Root economics × Soil moisture"
+)+ylim(c(0,0.75))+theme(legend.position = "none")+
+  theme(plot.margin = margin(t = 1, r = 1, b = 4, l = 1, unit = "pt"))
+p_bpc2_m
+
+p_bpc1_l <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Below_PC1",
+  mod = "Light",
+  mod_vals_num = c(-1.5, 0, 1.5),
+  mod_labels_num = c("Low", "Medium", "High light"),
+  x_label = "Root collaboration (Below_PC1)",
+  title = "(e) Root collaboration × Light"
+)+ylim(c(0,0.7))+theme(legend.position = "none")+
+  theme(plot.margin = margin(t = 1, r = 1, b = 4, l = 1, unit = "pt"))
+
+
+res_TE_f <- forest_TE_paired_sig_filter(
+  model = lme_full,
+  TE_terms = TE_terms,
+  pair_labels = pair_labels_TE,
+  time_var = "growth_time",
+  p_keep = 0.10,
+  title = "(b) Trait–environment interactions"
+)+theme(axis.text.y = element_text(size = 10)) +
+  theme(plot.margin = margin(t = 1, r = 1, b = 1, l = 1, unit = "pt"))
+
+res_TT_f <- forest_TT_paired_sig_filter(
+  model = lme_full,
+  TT_terms = TT_terms,
+  pair_labels = pair_labels,
+  time_var = "growth_time",
+  p_keep = 0.10,
+  title = "(a) Trait–trait interactions"
+)+ xlab(NULL)+theme(axis.text.y = element_text(size = 10)) + 
+  theme(plot.margin = margin(t = 1, r = 1, b = 4, l = 1, unit = "pt"))
+
+## ---- Left column: (a) over (b) ----
+p_left <- (res_TT_f / res_TE_f) +
+  plot_layout(
+    heights = c(4, 10),
+    guides = "collect"
+  )
+
+## ---- Right column: three panels stacked ----
+p_right <- (p_tt1 + p_bpc1_l + p_bpc2_m) +
+  plot_layout(ncol = 1)
+
+## ---- Combine left and right (1 : 2 width) ----
+fig6_all <- (p_left | p_right) +
+  plot_layout(
+    widths = c(0.7, 2),
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "bottom"
+  )
+
+fig6_all
+
+ggsave(
+  filename = "02_output_results_new/figs/fig6_combined.pdf",
+  plot     = fig6_all,
+  width    = 9,      # 建议宽度（英寸）
+  height   = 7,       # 建议高度（英寸）
+  units    = "in",
+  bg       = "white"  # 强制白底，避免透明
+)
+```
+
+# New Figure 4
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggeffects)
+library(grid)
+library(scales)
+library(eoffice)
+
+## ============================================================
+## 0) 统一的一些标签与样式
+## ============================================================
+
+panel_margin <- theme(
+  plot.margin = margin(t = 3, r = 3, b = 5, l = 3, unit = "pt")
+)
+
+trait_x_labels <- c(
+  "Above_PC1" = "Leaf economics\n(Above_PC1)",
+  "Above_PC2" = "Plant size\n(Above_PC2)",
+  "Above_PC3" = "Leaf area\n(Above_PC3)",
+  "Below_PC1" = "Root collaboration\n(Below_PC1)",
+  "Below_PC2" = "Root economics\n(Below_PC2)"
+)
+
+apply_trait_x_axis <- function(p, angle = 10, hjust = 1, vjust = 1, size = 9.5) {
+  p +
+    scale_x_discrete(labels = trait_x_labels) +
+    theme(
+      axis.text.x = element_text(
+        angle = angle, hjust = hjust, vjust = vjust,
+        size = size, colour = "black"
+      )
+    )
+}
+
+## ============================================================
+## 1) 左侧两幅图：从原始绘图函数开始重建
+##    依赖对象：plot_data_agg, label_data
+## ============================================================
+
+plot_group <- function(grp_name, title, remove_x = FALSE) {
+  d <- plot_data_agg %>% filter(Analysis_Group == grp_name)
+  l <- label_data %>% filter(Analysis_Group == grp_name)
+
+  p <- ggplot(d, aes(x = Specific_Var, y = Mean, color = Year, group = Year)) +
+    geom_errorbar(
+      aes(ymin = pmax(0, Mean - SE), ymax = Mean + SE),
+      width = 0.2, position = position_dodge(width = 0.7)
+    ) +
+    geom_point(position = position_dodge(width = 0.7), size = 4) +
+    geom_text(
+      data = l,
+      aes(x = Specific_Var, y = Max_Y * 1.15, label = Label),
+      inherit.aes = FALSE,
+      size = 5,
+      color = "black",
+      fontface = "bold"
+    ) +
+    scale_color_manual(values = c("1st" = "#FFE7CC", "2nd" = "#F8CBA6", "3rd" = "#E08E6D")) +
+    labs(title = title, x = NULL, y = "Relative Importance") +
+    theme_Publication() +
+    theme(legend.position = "none")
+
+  if (remove_x) {
+    p <- p + theme(axis.text.x = element_blank())
+  } else {
+    p <- p + theme(axis.text.x = element_text(angle = 10, hjust = 1, color = "black"))
+  }
+
+  p
+}
+
+## 左侧(a)
+fig4_a_panel <- plot_group("Trait_Main", "(a) Trait Main Effect", remove_x = TRUE) +
+  ylab(NULL) +
+  panel_margin
+
+## 左侧(b) —— 按你的要求添加 x 轴标题
+fig4_b_panel <- plot_group("TT_Interaction", "(b) Trait × Trait Interaction", remove_x = FALSE) +
+  labs(x = "Trait dimensions", y = "Relative Importance") +
+  panel_margin
+
+fig4_b_panel <- apply_trait_x_axis(fig4_b_panel, angle = 20, hjust = 1, size = 9.3)
+
+## ============================================================
+## 2) 右侧上半部分：图5(b)(c)(d)(e)(f) 从原始函数开始重建
+##    依赖对象：lme_full, total_scaled_tda1
+## ============================================================
+
+year_cols <- c("#F5E7C6", "#F7B980", "#DE802B")
+
+plot_trait_year_raw <- function(model_raw,
+                                data,
+                                trait,
+                                time_var = "growth_time",
+                                response_raw = "RGR",
+                                time_vals,
+                                time_labels = c("1st", "2nd", "3rd"),
+                                trait_range = NULL,
+                                title = NULL,
+                                colors = year_cols,
+                                show_ci = TRUE) {
+
+  pred <- ggpredict(
+    model_raw,
+    terms = c(
+      trait,
+      sprintf("%s [%s]", time_var, paste(time_vals, collapse = ", "))
+    ),
+    type = "fixed"
+  )
+
+  pred_df <- as.data.frame(pred) %>%
+    mutate(
+      Year = factor(group,
+                    levels = as.character(time_vals),
+                    labels = time_labels)
+    )
+
+  pal <- setNames(colors, time_labels)
+
+  p <- ggplot() +
+    # geom_point(
+    #   data = data,
+    #   aes(x = .data[[trait]], y = .data[[response_raw]], colour = comp_year),
+    #   alpha = 0.10,
+    #   size  = 0.05
+    # ) +
+    scale_color_manual(values = colors)
+
+  if (show_ci) {
+    p <- p + geom_ribbon(
+      data = pred_df,
+      aes(x = x, ymin = conf.low, ymax = conf.high, fill = Year),
+      alpha = 0.15,
+      colour = NA
+    )
+  }
+
+  p <- p +
+    geom_line(
+      data = pred_df,
+      aes(x = x, y = predicted, colour = Year),
+      linewidth = 1.2
+    ) +
+    scale_color_manual(values = pal, name = "Year") +
+    scale_fill_manual(values = pal, name = "Year") +
+    labs(x = trait, y = "RGR", title = title) +
+    theme_Publication(base_size = 11) +
+    theme(
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10),
+      legend.position = "none"
+    ) +
+    scale_y_continuous(labels = number_format(accuracy = 0.1)) +
+    scale_x_continuous(
+      breaks = function(x) floor(min(x)):ceiling(max(x))
+    )
+
+  if (!is.null(trait_range)) {
+    p <- p + coord_cartesian(xlim = trait_range, ylim = c(0, 1.2))
+  } else {
+    p <- p + coord_cartesian(ylim = c(0, 1.2))
+  }
+
+  p
+}
+
+gt_vals <- sort(as.numeric(unique(total_scaled_tda1$growth_time)))
+
+trait_vars <- c("Above_PC1", "Above_PC2", "Above_PC3", "Below_PC1", "Below_PC2")
+trait_ranges <- lapply(
+  total_scaled_tda1[trait_vars],
+  function(x) quantile(x, probs = c(0.001, 0.999), na.rm = TRUE)
+)
+
+## 图5(b)
+fig5_b_panel <- plot_trait_year_raw(
+  model_raw   = lme_full,
+  data        = total_scaled_tda1,
+  trait       = "Above_PC1",
+  time_vals   = gt_vals,
+  trait_range = trait_ranges$Above_PC1,
+  title       = "(c)"
+) +
+  xlab("Leaf economics") + ylab(NULL) +
+  scale_x_continuous(breaks = c(-4, -2, 0, 2, 4)) +
+  panel_margin
+
+## 图5(c)
+fig5_c_panel <- plot_trait_year_raw(
+  model_raw   = lme_full,
+  data        = total_scaled_tda1,
+  trait       = "Above_PC2",
+  time_vals   = gt_vals,
+  trait_range = trait_ranges$Above_PC2,
+  title       = "(d)"
+) +
+  xlab("Plant size") + ylab(NULL) +
+  scale_x_continuous(breaks = c(-4, -2, 0, 2, 4)) +
+  panel_margin+
+    theme(
+      axis.title.y = element_blank(),   
+      axis.text.y  = element_blank(),   
+      axis.ticks.y = element_blank(),   
+      axis.line.y  = element_blank(),   
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor.y = element_blank())
+
+
+## 图5(d)
+fig5_d_panel <- plot_trait_year_raw(
+  model_raw   = lme_full,
+  data        = total_scaled_tda1,
+  trait       = "Above_PC3",
+  time_vals   = gt_vals,
+  trait_range = trait_ranges$Above_PC3,
+  title       = "(e)"
+) +
+  xlab("Leaf area") + ylab(NULL) +
+  scale_x_continuous(breaks = c(-4, -2, 0, 2, 4)) +
+  panel_margin+
+    theme(
+      axis.title.y = element_blank(),   
+      axis.text.y  = element_blank(),   
+      axis.ticks.y = element_blank(),   
+      axis.line.y  = element_blank(),   
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor.y = element_blank())
+
+
+## 图5(e)
+fig5_e_panel <- plot_trait_year_raw(
+  model_raw   = lme_full,
+  data        = total_scaled_tda1,
+  trait       = "Below_PC1",
+  time_vals   = gt_vals,
+  trait_range = trait_ranges$Below_PC1,
+  title       = "(f)"
+) +
+  xlab("Root collaboration") +
+  ylab(expression("Relative growth rate (RGR, log cm yr"^{-1}*")")) +
+  scale_x_continuous(breaks = c(-4, -2, 0, 2, 4)) +
+  panel_margin
+
+## 图5(f)
+fig5_f_panel <- plot_trait_year_raw(
+  model_raw   = lme_full,
+  data        = total_scaled_tda1,
+  trait       = "Below_PC2",
+  time_vals   = gt_vals,
+  trait_range = trait_ranges$Below_PC2,
+  title       = "(g)") +
+  xlab("Root economics") + ylab(NULL) +
+  scale_x_continuous(breaks = c(-4, -2, 0, 2, 4)) +
+  panel_margin+
+    theme(
+      axis.title.y = element_blank(),   
+      axis.text.y  = element_blank(),   
+      axis.ticks.y = element_blank(),   
+      axis.line.y  = element_blank(),   
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor.y = element_blank())
+
+## ============================================================
+## 3) 右侧下半部分：图6(c) 从原始函数开始重建
+##    依赖对象：lme_full, total_scaled_tda1
+## ============================================================
+
+plot_3way_time2 <- function(model,
+                            data,
+                            x,
+                            mod,
+                            time = "growth_time",
+                            time_vals = c(-1.7059989, -0.2379998, 1.2299992),
+                            time_labels = c("1st year", "2nd year", "3rd year"),
+                            mod_vals_num = c(-1, 0, 1),
+                            mod_labels_num = c("Low", "Medium", "High"),
+                            mod_vals_fac = NULL,
+                            mod_labels_fac = NULL,
+                            x_label = NULL,
+                            y_label = "Predicted RGR",
+                            title = NULL,
+                            palette = c("#B7B2D0", "#E0A8A8", "#448870"),
+                            ribbon_alpha = 0.18,
+                            response_raw = "RGR",
+                            show_points = TRUE,
+                            point_alpha = 0.10,
+                            point_size = 0.05,
+                            points_by_mod = FALSE,
+                            time_round_digits = 6) {
+
+  stopifnot(x %in% names(data), mod %in% names(data), time %in% names(data))
+  stopifnot(response_raw %in% names(data))
+
+  if (is.null(x_label)) x_label <- x
+  if (is.null(title)) title <- sprintf("(%s × %s) × %s", x, mod, time)
+
+  mod_is_factor <- is.factor(data[[mod]]) || is.character(data[[mod]])
+
+  if (!mod_is_factor) {
+    term_mod <- sprintf("%s [%s]", mod, paste(mod_vals_num, collapse = ", "))
+    group_levels <- as.character(mod_vals_num)
+    group_labels <- mod_labels_num
+    pal <- palette
+  } else {
+    if (is.null(mod_vals_fac)) mod_vals_fac <- levels(as.factor(data[[mod]]))
+    if (is.null(mod_labels_fac)) mod_labels_fac <- mod_vals_fac
+
+    term_mod <- sprintf("%s [%s]", mod, paste(mod_vals_fac, collapse = ", "))
+    group_levels <- mod_vals_fac
+    group_labels <- mod_labels_fac
+    pal <- palette[seq_len(length(mod_vals_fac))]
+  }
+
+  term_time <- sprintf("%s [%s]", time, paste(time_vals, collapse = ", "))
+
+  x_range <- as.numeric(quantile(data[[x]], probs = c(0.05, 0.95), na.rm = TRUE))
+
+  pred <- ggpredict(model,
+                    terms = c(x, term_mod, term_time),
+                    type = "fixed")
+
+  df <- as.data.frame(pred) %>%
+    mutate(
+      Mod  = factor(group, levels = group_levels, labels = group_labels),
+      Year = factor(as.character(facet),
+                    levels = as.character(time_vals),
+                    labels = time_labels)
+    )
+
+  year_map <- tibble(
+    gt = round(as.numeric(time_vals), time_round_digits),
+    Year = factor(gt,
+                  levels = round(as.numeric(time_vals), time_round_digits),
+                  labels = time_labels)
+  )
+
+  data_pt <- data %>%
+    mutate(gt = round(as.numeric(.data[[time]]), time_round_digits)) %>%
+    left_join(year_map, by = "gt") %>%
+    filter(!is.na(Year))
+
+  p <- ggplot()
+
+  if (show_points) {
+    p <- p #+
+      # geom_point(
+      #   data = data_pt,
+      #   aes(x = .data[[x]], y = .data[[response_raw]]),
+      #   colour = "grey60",
+      #   alpha  = point_alpha,
+      #   size   = point_size
+      # )
+  }
+
+  p <- p +
+    geom_line(
+      data = df,
+      aes(x = x, y = predicted, colour = Mod),
+      linewidth = 1.1
+    ) +
+    facet_wrap(~Year, nrow = 1) +
+    scale_color_manual(values = pal) +
+    scale_fill_manual(values = pal) +
+    labs(x = x_label, y = y_label, colour = mod, fill = mod, title = title) +
+    coord_cartesian(xlim = x_range) +
+    theme_Publication() +
+    theme(
+      strip.background = element_rect(fill = "white", colour = NA),
+      strip.text       = element_text(colour = "black"),
+      legend.position  = "bottom"
+    )
+
+  p
+}
+
+fig6_c_panel <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Above_PC1",
+  mod = "Below_PC2",
+  mod_vals_num = c(-1.5, 0, 1.5),
+  mod_labels_num = c("low", "Medium", "high plant size"),
+  x_label = "Leaf economics (Above_PC1)",
+  title = "(h) Leaf economics × Root economics"
+) +
+  ylim(c(0, 0.75)) +
+  panel_margin
+
+## ============================================================
+## 4) patchwork 拼接
+##    左列两行；右列三行（25%,25%,50%）
+## ============================================================
+
+left_col <- fig4_a_panel / fig4_b_panel +
+  plot_layout(heights = c(1, 1))
+
+design_right <- "
+ABC
+DEF
+GGG
+"
+
+## 这里把第三排包起来，避免 p_tt1 这类分面图再次触发 wrap_dims
+right_col <- wrap_plots(
+  A = fig5_b_panel,
+  B = fig5_c_panel,
+  C = fig5_d_panel,
+  D = fig5_e_panel,
+  E = fig5_f_panel,
+  F = plot_spacer(),
+  G = wrap_elements(full = ggplotGrob(fig6_c_panel)),
+  design = design_right
+) +
+  plot_layout(heights = c(1, 1, 2.3))   # 25%, 25%, 50%
+
+fig_recombined_final <- left_col | right_col +
+  plot_layout(widths = c(1, 1))
+
+fig_recombined_final
+
+
+out_dir <- "02_output_results_new/figs"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+ggsave(
+  filename = file.path(out_dir, "new_figure5_combined.png"),
+  plot     = fig_recombined_final,
+  width    = 8,
+  height   = 7,
+  units    = "in",
+  bg       = "white"
+)
+
+topptx(
+ fig_recombined_final,
+  filename = file.path(out_dir, "new_figure5_combined.pptx"),
+  width = 8,
+  height = 6
+)
+```
+
+
+# New Figure 5
+```{r}
+library(patchwork)
+library(ggplot2)
+
+## ============================================================
+## 1) 指定子图对象
+## ============================================================
+
+# 来自旧 Figure 4
+new5_a_panel <- p_d   # 旧图4(d) -> 新图5(a)
+new5_b_panel <- p_e   # 旧图4(e) -> 新图5(b)
+new5_c_panel <- p_c   # 旧图4(c) -> 新图5(c)
+
+# 来自旧 Figure 5
+new5_d_panel <- p_light       # 旧图5(g)
+new5_e_panel <- p_moist       # 旧图5(h)
+new5_f_panel <- p_ap   # 旧图5(f)
+
+# 来自旧 Figure 6
+new5_g_panel <- p_bpc2_m      # 旧图6(d)
+new5_h_panel <- p_bpc1_l      # 旧图6(e)
+
+## ============================================================
+## 2) 图例设置
+##    建议只保留右侧最后需要的图例，其他先关掉
+## ============================================================
+
+new5_a_panel <- new5_a_panel + theme(legend.position = "none")
+new5_b_panel <- new5_b_panel + theme(legend.position = "none")
+new5_c_panel <- new5_c_panel + theme(legend.position = "none")
+
+new5_d_panel <- new5_d_panel + theme(legend.position = "none")
+new5_e_panel <- new5_e_panel + theme(legend.position = "none")
+new5_f_panel <- new5_f_panel + theme(legend.position = "none")
+
+new5_g_panel <- new5_g_panel + theme(legend.position = "none")
+new5_h_panel <- new5_h_panel + theme(legend.position = "bottom")
+
+## ============================================================
+## 3) 左侧竖列：新图5(a)(b)(c)
+## ============================================================
+
+left_col <- new5_a_panel / new5_b_panel / new5_c_panel +
+  plot_layout(heights = c(1, 1, 1))
+
+## ============================================================
+## 4) 右侧第一排：旧图5(g)(h)(f)
+## ============================================================
+
+right_top <- new5_d_panel | new5_e_panel | new5_f_panel
+
+## ============================================================
+## 5) 右侧第二排、第三排：旧图6(d)、旧图6(e)
+##    这两个面板横跨整排
+## ============================================================
+
+right_col <- right_top / new5_g_panel / new5_h_panel +
+  plot_layout(heights = c(1, 1.1, 1.1))
+
+## ============================================================
+## 6) 左右拼接
+## ============================================================
+
+fig5_new <- left_col | right_col +
+  plot_layout(widths = c(1, 2.8))
+
+fig5_new
+
+library(ggplot2)
+library(eoffice)
+
+out_dir <- "02_output_results_new/figs"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+ggsave(
+  filename = file.path(out_dir, "new_figure5_combined.png"),
+  plot     = fig5_new,
+  width    = 8,
+  height   = 9,
+  units    = "in",
+  bg       = "white"
+)
+
+topptx(
+  fig5_new,
+  filename = file.path(out_dir, "new_figure5_combined.pptx"),
+  width = 8,
+  height = 9
+)
+```
+
+```{r,eval=FALSE}
+
+p_tt2 <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Above_PC3",
+  mod = "Below_PC2",
+  mod_vals_num = c(-2, 0, 2),
+  mod_labels_num = c("low", "Medium", "high root econ"),
+  x_label = "Leaf area (Above_PC3)",
+  title = "(b) Leaf area × Root economics "
+)+ylim(c(0,1.2))
+p_tt2
+
+p_apc2_light <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Above_PC2",
+  mod = "Light",
+  mod_vals_num = c(-1.5, 0, 1.5),
+  mod_labels_num = c("Low", "Medium", "High light"),
+  x_label = "Plant size (Above_PC2)",
+  title = "(b) Plant size × Light"
+)+ylim(c(0,1.2))
+p_apc2_light
+
+p_apc1_ap <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Above_PC1",
+  mod = "AP",
+  mod_vals_num = c(-1.5, 0, 1.5),
+  mod_labels_num = c("Low", "Medium", "High light"),
+  x_label = "Plant size (Above_PC2)",
+  title = "(b) Plant size × Light")+ylim(c(0,1.2))
+p_apc1_ap
+
+p_compete <- plot_3way_time2(
+  model = lme_full,
+  data  = total_scaled_tda1,
+  x = "Above_PC3",
+  mod = "Compete",
+  mod_vals_fac   = c("alone", "inter"),
+  mod_labels_fac = c("Competition-free", "Competition"),
+  x_label = "Leaf area (Above_PC3)",
+  title = "(c) Leaf area × Competition",
+  palette = c("#B7B2D0", "#e3a561", "#448870"),
+)+ylim(c(0,1.1))
+p_compete
+
+
+```
+
+### Figure 6 这部分基于部分生长模型的可视化结果
+```{r}
+library(lmerTest)
+library(sjPlot)
+library(ggeffects)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+col_levels <- c("#B7B2D0", "#e3a561", "#448870")
+
+x_min_med_max <- function(x) {
+  x <- x[is.finite(x)]
+  c(min(x), median(x), max(x))
+}
+
+make_level_labels <- function(vals, prefix = c("Low", "Median", "High"), digits = 2) {
+  sprintf("%s (%.2f)", prefix, round(as.numeric(vals), digits))
+}
+
+fit_lmm <- function(formula, dat) {
+  lmer(
+    formula,
+    data = dat,
+    REML = FALSE,
+    control = lmerControl(optimizer = "bobyqa")
+  )
+}
+
+pred_term <- function(var, vals) {
+  sprintf("%s [%.6f, %.6f, %.6f]", var, vals[1], vals[2], vals[3])
+}
+
+plot_pred_lines <- function(pred_df, title, xlab, ylab, legend_title, legend_labels) {
+  ggplot(pred_df, aes(x = x, y = predicted, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.18, color = NA) +
+    geom_line(linewidth = 1.1) +
+    scale_color_manual(values = col_levels, labels = legend_labels) +
+    scale_fill_manual(values = col_levels, labels = legend_labels) +
+    labs(title = title, x = xlab, y = ylab, color = legend_title, fill = legend_title) +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold"))
+}
+
+combine_ab <- function(p_left, p_right, legend_pos = "bottom") {
+  (p_left | p_right) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = legend_pos)
+}
+
+years <- list("1st" = tda_1st,"2nd"=tda_2nd, "3rd" = tda_3rd)
+
+# =========================
+# 0) Model tables (optional)
+# =========================
+formula_moist <- RGR_scale ~ (Above_PC1 + Below_PC2) * Moisture + Above_PC1:Below_PC2 + (1|sp) + (1|Nenv)
+mod_moist_1st <- fit_lmm(formula_moist, years[["1st"]])
+mod_moist_2nd <- fit_lmm(formula_moist, years[["2nd"]])
+mod_moist_3rd <- fit_lmm(formula_moist, years[["3rd"]])
+tab_model(mod_moist_1st, mod_moist_3rd, title = "Moisture model")
+
+# =========================
+# 1) Above × Below (fix Moisture at mean)
+# =========================
+above_vals_shared <- x_min_med_max(c(years[["1st"]]$Above_PC1, years[["3rd"]]$Above_PC1))
+lab_above <- make_level_labels(above_vals_shared)
+
+pred_ab_below_1st <- ggpredict(
+  mod_moist_1st,
+  terms = c(
+    "Below_PC2 [all]",
+    pred_term("Above_PC1", above_vals_shared),
+    "Moisture [mean]"
+  )
+)
+
+pred_ab_below_2nd<- ggpredict(
+  mod_moist_2nd,
+  terms = c(
+    "Below_PC2 [all]",
+    pred_term("Above_PC1", above_vals_shared),
+    "Moisture [mean]"
+  )
+)
+
+p_int_above_below_1st <- plot_pred_lines(
+  pred_ab_below_1st,
+  title = "(a) 1st year",
+  xlab = "Below_PC2",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "Above_PC1",
+  legend_labels = lab_above
+)+theme_Publication(base_size = 11)
+
+p_int_above_below_2nd <- plot_pred_lines(
+  pred_ab_below_2nd,
+  title = "(b) 3rd year",
+  xlab = "Below_PC2",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "Above_PC1",
+  legend_labels = lab_above
+)+theme_Publication(base_size = 11)
+
+fig_int_above_below <- combine_ab(p_int_above_below_1st, p_int_above_below_2nd)
+fig_int_above_below
+
+# =========================
+# 2) Above × Moisture (fix Below at median)
+# =========================
+formula_ap <- RGR_scale ~ (Above_PC1 + Below_PC2) * AP + Above_PC1:Below_PC2 + (1|sp) + (1|Nenv)
+mod_ap_1st <- fit_lmm(formula_ap, years[["1st"]])
+mod_ap_3rd <- fit_lmm(formula_ap, years[["3rd"]])
+tab_model(mod_ap_1st, mod_ap_3rd, title = "AP model")
+
+moist_vals_shared <- x_min_med_max(c(years[["1st"]]$Moisture, years[["3rd"]]$Moisture))
+lab_moist <- make_level_labels(moist_vals_shared)
+
+pred_ab_moist_1st <- ggpredict(
+  mod_moist_1st,
+  terms = c(
+    "Above_PC1 [all]",
+    pred_term("Moisture", moist_vals_shared),
+    "Below_PC2 [median]"
+  )
+)
+
+pred_ab_moist_3rd <- ggpredict(
+  mod_moist_3rd,
+  terms = c(
+    "Above_PC1 [all]",
+    pred_term("Moisture", moist_vals_shared),
+    "Below_PC2 [median]"
+  )
+)
+
+p_int_above_moist_1st <- plot_pred_lines(
+  pred_ab_moist_1st,
+  title = "(a) 1st year",
+  xlab = "Above_PC1",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "Moisture",
+  legend_labels = lab_moist
+)+theme_Publication(base_size = 11)
+
+p_int_above_moist_3rd <- plot_pred_lines(
+  pred_ab_moist_3rd,
+  title = "(b) 3rd year",
+  xlab = "Above_PC1",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "Moisture",
+  legend_labels = lab_moist
+)+theme_Publication(base_size = 11)
+
+fig_int_above_moist <- combine_ab(p_int_above_moist_1st, p_int_above_moist_3rd)
+fig_int_above_moist 
+# =========================
+# 3) Below × Moisture (fix Above at median)
+# =========================
+pred_below_moist_1st <- ggpredict(
+  mod_moist_1st,
+  terms = c(
+    "Below_PC2 [all]",
+    pred_term("Moisture", moist_vals_shared),
+    "Above_PC1 [median]"
+  )
+)
+
+pred_below_moist_3rd <- ggpredict(
+  mod_moist_3rd,
+  terms = c(
+    "Below_PC2 [all]",
+    pred_term("Moisture", moist_vals_shared),
+    "Above_PC1 [median]"
+  )
+)
+
+p_int_below_moist_1st <- plot_pred_lines(
+  pred_below_moist_1st,
+  title = "(a) 1st year",
+  xlab = "Below_PC2",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "Moisture",
+  legend_labels = lab_moist)+theme_Publication(base_size = 11)
+
+p_int_below_moist_3rd <- plot_pred_lines(
+  pred_below_moist_3rd,
+  title = "(b) 3rd year",
+  xlab = "Below_PC2",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "Moisture",
+  legend_labels = lab_moist)+theme_Publication(base_size = 11)
+
+fig_int_below_moist <- combine_ab(p_int_below_moist_1st, p_int_below_moist_3rd)
+fig_int_below_moist
+
+# =========================
+# 4) Above × AP (fix Below at median)
+# =========================
+ap_vals_shared <- x_min_med_max(c(years[["1st"]]$AP, years[["3rd"]]$AP))
+lab_ap <- make_level_labels(ap_vals_shared)
+
+pred_ab_ap_1st <- ggpredict(
+  mod_ap_1st,
+  terms = c(
+    "Above_PC1 [all]",
+    pred_term("AP", ap_vals_shared),
+    "Below_PC2 [median]"
+  )
+)
+
+pred_ab_ap_3rd <- ggpredict(
+  mod_ap_3rd,
+  terms = c(
+    "Above_PC1 [all]",
+    pred_term("AP", ap_vals_shared),
+    "Below_PC2 [median]"
+  )
+)
+
+p_int_above_ap_1st <- plot_pred_lines(
+  pred_ab_ap_1st,
+  title = "(a) 1st year",
+  xlab = "Above_PC1",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "AP",
+  legend_labels = lab_ap
+)+theme_Publication(base_size = 11)
+
+p_int_above_ap_3rd <- plot_pred_lines(
+  pred_ab_ap_3rd,
+  title = "(b) 3rd year",
+  xlab = "Above_PC1",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "AP",
+  legend_labels = lab_ap
+)+theme_Publication(base_size = 11)
+
+fig_int_above_ap <- combine_ab(p_int_above_ap_1st, p_int_above_ap_3rd)
+fig_int_above_ap
+# =========================
+# 5) Below × AP (fix Above at median)
+# =========================
+pred_below_ap_1st <- ggpredict(
+  mod_ap_1st,
+  terms = c(
+    "Below_PC2 [all]",
+    pred_term("AP", ap_vals_shared),
+    "Above_PC1 [median]"
+  )
+)
+
+pred_below_ap_3rd <- ggpredict(
+  mod_ap_3rd,
+  terms = c(
+    "Below_PC2 [all]",
+    pred_term("AP", ap_vals_shared),
+    "Above_PC1 [median]"
+  )
+)
+
+p_int_below_ap_1st <- plot_pred_lines(
+  pred_below_ap_1st,
+  title = "(a) 1st year",
+  xlab = "Below_PC2",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "AP",
+  legend_labels = lab_ap
+)+theme_Publication(base_size = 11)
+
+p_int_below_ap_3rd <- plot_pred_lines(
+  pred_below_ap_3rd,
+  title = "(b) 3rd year",
+  xlab = "Below_PC2",
+  ylab = "Predicted RGR (scaled)",
+  legend_title = "AP",
+  legend_labels = lab_ap
+)+theme_Publication(base_size = 11)
+
+fig_int_below_ap <- combine_ab(p_int_below_ap_1st, p_int_below_ap_3rd)
+fig_int_below_ap
+# =========================
+# Print all figures
+# =========================
+
+
+allfigs <- allfigs <- wrap_plots(
+  p_int_above_below_1st + ggtitle("(a)")+theme(legend.position = "none"), 
+  p_int_above_moist_1st + ggtitle("(b)")+theme(legend.position = "none"), 
+  p_int_below_moist_1st + ggtitle("(c)")+theme(legend.position = "none"), 
+  p_int_above_below_2nd + ggtitle("(d)"),
+  p_int_above_moist_3rd + ggtitle("(e)"),
+  p_int_below_moist_3rd + ggtitle("(f)"),
+  ncol = 3
+)
+allfigs
+ggsave(allfigs,file="02_output_results_new/figs/fig6_TE_TT.pdf",height = 6,width = 9)
+
+topptx(allfigs,file="02_output_results_new/figs/fig6_TE_TT.pptx", width = 9, height = 6)
+
+
+print(fig_int_above_below)   # Fig: Above_PC1 × Below_PC2 (Moisture fixed)
+print(fig_int_above_moist)   # Fig: Above_PC1 × Moisture (Below fixed)
+print(fig_int_below_moist)   # Fig: Below_PC2 × Moisture (Above fixed)
+print(fig_int_above_ap)      # Fig: Above_PC1 × AP (Below fixed)
+print(fig_int_below_ap)      # Fig: Below_PC2 × AP (Above fixed)
+
+
+# Assumes you have already created:
+# fig_int_above_below, fig_int_above_moist, fig_int_below_moist, fig_int_above_ap, fig_int_below_ap
+
+library(patchwork)
+
+all_interaction_figs <- (
+  fig_int_above_below /
+  fig_int_above_moist /
+  fig_int_below_moist 
+) +
+  plot_layout(heights = rep(1, 3), guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(all_interaction_figs)
+```
+
+
+### Figure SX. simple linear model between PC axis and RGR
+```{r}
+indtraits_tda_long <- indtraits_tda %>%
+  pivot_longer(
+    cols = all_of(trait.names),
+    names_to = "trait",
+    values_to = "values"
+  ) %>%
+  drop_na(values) %>%
+  mutate(
+    comp_year = factor(comp_year, levels = c("1st", "2nd", "3rd")),
+    Nenv = factor(Nenv, levels = c("6", "5", "4", "9", "2", "3", "7", "8", "1")),
+    trait = factor(trait, levels = trait.names)
+  )
+
+table(indtraits_tda$comp_year)
+
+############################### Data Transformation for Visualization ###############################
+# Reshape data to long format for PCA traits
+pca_tda_long <- gather(pcatraits_tda[, c(
+  "sp", "sp_abbr", "Nenv", "ring.num", "Light", "Moisture", "AP", "Compete", "growth_time", "final_height",
+  "comp_year", "BM", "ABM", "RSR", "UBM", "RGR", "Above_PC1", "Above_PC2","Above_PC3", "Below_PC1", "Below_PC2")], trait, values, pca_traits)
+pca_tda_long <- na.omit(pca_tda_long)
+
+fig2c_pcatrait_com_sp_heter <- ggplot(pca_tda_long, aes(x = values, y = RGR)) +
+  geom_point(aes(col = comp_year), alpha = 0.3, size = 0.1) +
+  facet_grid(sp ~ trait, scales = "free") +
+  geom_smooth(
+    method = "lm",
+    aes(group = comp_year, fill = comp_year),
+    col = "black", alpha = 0.7, size = 0.15, se = TRUE
+  ) +
+  labs(
+    x = "Standardized trait values",
+    y = expression("Relative growth rate" ~ "(" * RGR * "," ~ log ~ cm ~ yr^{-1} * ")")
+  ) +
+  scale_color_manual(
+    values = c("#B7B2D0", "#e3a561", "#448870"),
+    labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  scale_fill_manual(
+    values = c("#B7B2D0", "#e3a561", "#448870"),
+    labels = c("alone" = "Competition-free", "inter" = "Competition")
+  ) +
+  scale_x_continuous(breaks = pretty(pca_tda_long$values, n = 5)) +
+  ylim(c(0, 1.2)) +
+  theme_Publication(base_size = 12) +scale_y_continuous(
+  labels = label_number(accuracy = 0.1, trim = TRUE)) + 
+  theme(
+    legend.position = "bottom",
+    legend.key.size = unit(0.4, "cm"),
+    legend.text = element_text(size = 15),
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 10, colour = "black"),
+    axis.text.y = element_text(size = 10, colour = "black")
+  )
+
+fig2c_pcatrait_com_sp_heter
+ggsave(
+  filename = "02_output_results_new/figs/figS10_pcatrait_com_sp_heter.pdf",
+  plot = fig2c_pcatrait_com_sp_heter,
+  width = 8,
+  height = 9)
+```
+
